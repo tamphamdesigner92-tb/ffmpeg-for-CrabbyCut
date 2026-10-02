@@ -1,0 +1,4 @@
+# Kịch bản bash và mã nguồn FFmpeg cần LF (máy Windows thường bật core.autocrlf).
+* text=auto eol=lf
+# Bản vá giữ nguyên từng byte để `git apply` khớp.
+*.patch -text

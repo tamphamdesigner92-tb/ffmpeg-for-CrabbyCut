@@ -1,0 +1,4 @@
+# Bản vá áp lên FFmpeg n8.1.1, theo đúng thứ tự dưới đây (build.sh đọc tệp này).
+# Sinh lại bằng scripts/export-patches.sh từ nhánh của bản fork.
+0001.patch  bộ lọc CUDA crabgeo_cuda/crabblend_cuda, vá fftools/hwdownload/hwcontext_cuda cho GPU
+0002.patch  bộ lọc CUDA chờ GPU từng khung (sync=1), bỏ tải lên qua bộ đệm ghim

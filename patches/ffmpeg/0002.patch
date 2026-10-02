@@ -1,0 +1,252 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "Tam Pham (Windows)" <tampham.designer92@gmail.com>
+Date: Fri, 2 Oct 2026 11:33:14 +0700
+Subject: [PATCH 2/2] =?UTF-8?q?CrabbyCut:=20b=E1=BB=99=20l=E1=BB=8Dc=20CUD?=
+ =?UTF-8?q?A=20ch=E1=BB=9D=20GPU=20t=E1=BB=ABng=20khung=20(sync=3D1),=20b?=
+ =?UTF-8?q?=E1=BB=8F=20t=E1=BA=A3i=20l=C3=AAn=20qua=20b=E1=BB=99=20=C4=91?=
+ =?UTF-8?q?=E1=BB=87m=20ghim?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Đồ thị GPU của sidecar (mục 1.21) để GPU chạy không đồng bộ thì bản xuất có khung
+rách/lệch thời gian khi luồng lọc chạy trước GPU: NVENC đọc khung đuôi khi kernel chép
+chưa xong (hàng 0-671 của khung cũ), lớp phủ chữ hiện khung cũ hơn 6 / mới hơn 2 —
+nhiều nhất khi 3 lượt xuất chạy song song (Bin Tom, 2026-10-02).
+
+- crabgeo_cuda, crabblend_cuda: tuỳ chọn `sync` (mặc định 1) — cuStreamSynchronize
+  sau khi xếp kernel của khung.
+- hwcontext_cuda: chờ cả lúc tải lên; bỏ đường tải lên qua bộ đệm ghim (bản trước) —
+  nó làm lộ lỗi trên cả khi ra FFV1, mà không nhanh hơn.
+Chờ ở mọi chỗ: 9/9 lượt song song sạch, thời gian như cũ (10-12 s).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ libavfilter/vf_crabblend_cuda.c |   5 ++
+ libavfilter/vf_crabgeo_cuda.c   |  11 +++-
+ libavutil/hwcontext_cuda.c      | 108 +++-----------------------------
+ 3 files changed, 22 insertions(+), 102 deletions(-)
+
+diff --git a/libavfilter/vf_crabblend_cuda.c b/libavfilter/vf_crabblend_cuda.c
+index a8389f3..7d67282 100644
+--- a/libavfilter/vf_crabblend_cuda.c
++++ b/libavfilter/vf_crabblend_cuda.c
+@@ -86,6 +86,7 @@ typedef struct CrabBlendCUDAContext {
+     AVExpr *x_pexpr, *y_pexpr, *opacity_pexpr;
+     double var_values[VAR_VARS_NB];
+     int eval_mode;
++    int sync;
+     int x, y;
+     int opacity255;
+ } CrabBlendCUDAContext;
+@@ -273,6 +274,8 @@ static int do_blend(FFFrameSync *fs)
+         ret = blend_plane(avctx, mainpic, second, 1, s->hsub, s->vsub);
+     if (ret >= 0)
+         ret = blend_plane(avctx, mainpic, second, 2, s->hsub, s->vsub);
++    if (ret >= 0 && s->sync)
++        ret = CHECK_CU(cu->cuStreamSynchronize(s->cu_stream));
+     CHECK_CU(cu->cuCtxPopCurrent(&dummy));
+     if (ret < 0)
+         goto fail;
+@@ -468,6 +471,8 @@ static const AVOption crabblend_cuda_options[] = {
+         { "frame", "eval expressions per-frame",                  0, AV_OPT_TYPE_CONST, { .i64 = EVAL_MODE_FRAME }, .flags = FLAGS, .unit = "eval" },
+     { "shortest", "force termination when the shortest input terminates", OFFSET(fs.opt_shortest), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, FLAGS },
+     { "repeatlast", "repeat overlay of the last overlay frame", OFFSET(fs.opt_repeatlast), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, FLAGS },
++    /* CrabbyCut: chờ GPU xong phép trộn rồi mới đưa khung đi — xem `sync` của vf_crabgeo_cuda.c. */
++    { "sync", "wait for the GPU to finish each output frame", OFFSET(sync), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, FLAGS },
+     { NULL },
+ };
+ 
+diff --git a/libavfilter/vf_crabgeo_cuda.c b/libavfilter/vf_crabgeo_cuda.c
+index 056a5c0..e6adea9 100644
+--- a/libavfilter/vf_crabgeo_cuda.c
++++ b/libavfilter/vf_crabgeo_cuda.c
+@@ -16,6 +16,12 @@
+  *   alpha_chroma                 màu 4:2:0 của nguồn RGBA = trung bình theo trọng số alpha
+  *   passthrough                  không đổi gì thì trả nguyên khung (0 = luôn chép sang vùng nhớ
+  *                                của bộ lọc, vd. để NVENC chỉ thấy MỘT vùng nhớ)
++ *   sync                         chờ GPU xong khung rồi mới đưa đi (mặc định 1). Để luồng lọc chạy
++ *                                trước GPU thì bản xuất có khung RÁCH/lệch thời gian: NVENC đọc khung
++ *                                đuôi khi kernel chép chưa xong (phần trên của khung cũ), lớp phủ chữ
++ *                                hiện khung cũ hơn 6 hoặc mới hơn 2 — đo 2026-10-02 trên Bin Tom, nhiều
++ *                                nhất khi 3 lượt xuất chạy song song. Chờ ở cả crabgeo, crabblend và
++ *                                lúc tải lên thì sạch (9/9 lượt) mà không chậm hơn (10–12 s cả hai).
+  *
+  * Mô hình toạ độ: tâm điểm ảnh luma i ở i + 0.5. Mẫu ra thứ i của một mặt phẳng nằm ở
+  * off + i*sub (toạ độ luma khung ra); ánh xạ sang nguồn: crop + (X - pos) * ratio; rồi sang chỉ
+@@ -115,7 +121,7 @@ typedef struct CrabGeoCUDAContext {
+     int w, h, ow, oh;
+     double x, y;
+     int bg, interp, out_matrix, out_range, in_matrix, in_range;
+-    int alpha_chroma, passthrough;
++    int alpha_chroma, passthrough, sync;
+     int passthrough_geom;
+ 
+     /* dựng từ định dạng/cỡ */
+@@ -847,6 +853,8 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
+         ret = build_tables(avctx, in->chroma_location);
+     if (ret >= 0)
+         ret = process(avctx, in, out, identity, &m);
++    if (ret >= 0 && s->sync)
++        ret = CHECK_CU(cu->cuStreamSynchronize(s->cu_stream));
+     CHECK_CU(cu->cuCtxPopCurrent(&dummy));
+     if (ret < 0)
+         goto fail;
+@@ -923,6 +931,7 @@ static const AVOption crabgeo_cuda_options[] = {
+         { "pc",   NULL, 0, AV_OPT_TYPE_CONST, { .i64 = RNG_PC },   0, 0, FLAGS, .unit = "irng" },
+     { "alpha_chroma", "alpha-weighted 4:2:0 chroma", OFFSET(alpha_chroma), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, FLAGS },
+     { "passthrough", "pass frames through when nothing changes", OFFSET(passthrough), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, FLAGS },
++    { "sync", "wait for the GPU to finish each output frame", OFFSET(sync), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, FLAGS },
+     { NULL },
+ };
+ 
+diff --git a/libavutil/hwcontext_cuda.c b/libavutil/hwcontext_cuda.c
+index c45131f..1c46eca 100644
+--- a/libavutil/hwcontext_cuda.c
++++ b/libavutil/hwcontext_cuda.c
+@@ -30,20 +30,9 @@
+ #include "pixfmt.h"
+ #include "imgutils.h"
+ 
+-/* CrabbyCut: bộ đệm ghim cho tải lên (xem cuda_transfer_data). */
+-#define CUDA_UPLOAD_SLOTS 4
+-typedef struct CUDAUploadSlot {
+-    uint8_t *host;
+-    size_t size;
+-    CUevent ev;
+-    int pending;
+-} CUDAUploadSlot;
+-
+ typedef struct CUDAFramesContext {
+     int shift_width, shift_height;
+     int tex_alignment;
+-    CUDAUploadSlot up[CUDA_UPLOAD_SLOTS];
+-    int up_next;
+ } CUDAFramesContext;
+ 
+ typedef struct CUDADeviceContext {
+@@ -151,30 +140,6 @@ fail:
+     return ret;
+ }
+ 
+-static void cuda_frames_uninit(AVHWFramesContext *ctx)
+-{
+-    CUDAFramesContext       *priv = ctx->hwctx;
+-    AVHWDeviceContext *device_ctx = ctx->device_ctx;
+-    AVCUDADeviceContext    *hwctx = device_ctx->hwctx;
+-    CudaFunctions             *cu = hwctx->internal->cuda_dl;
+-    CUcontext dummy;
+-    int i;
+-
+-    if (CHECK_CU(cu->cuCtxPushCurrent(hwctx->cuda_ctx)) < 0)
+-        return;
+-    for (i = 0; i < CUDA_UPLOAD_SLOTS; i++) {
+-        CUDAUploadSlot *u = &priv->up[i];
+-        if (u->ev) {
+-            CHECK_CU(cu->cuEventSynchronize(u->ev));
+-            CHECK_CU(cu->cuEventDestroy(u->ev));
+-        }
+-        if (u->host)
+-            CHECK_CU(cu->cuMemFreeHost(u->host));
+-        memset(u, 0, sizeof(*u));
+-    }
+-    CHECK_CU(cu->cuCtxPopCurrent(&dummy));
+-}
+-
+ static int cuda_frames_init(AVHWFramesContext *ctx)
+ {
+     AVHWDeviceContext *device_ctx = ctx->device_ctx;
+@@ -289,66 +254,9 @@ static int cuda_transfer_data(AVHWFramesContext *ctx, AVFrame *dst,
+     if (ret < 0)
+         return ret;
+ 
+-    /* CrabbyCut: TẢI LÊN qua bộ đệm ghim. cuMemcpy2DAsync từ bộ nhớ pageable ngầm chờ mọi việc
+-     * trước đó trên stream chung (kernel của các bộ lọc khác) -> luồng lọc và GPU chờ nhau tuần
+-     * tự. Chép vào bộ đệm ghim (memcpy CPU) rồi chép không đồng bộ: thứ tự vẫn trên stream chung,
+-     * bộ đệm chỉ dùng lại sau khi event của lượt chép trước đã xong. */
+-    if (!src->hw_frames_ctx && dst->hw_frames_ctx && cu->cuMemAllocHost && cu->cuMemFreeHost) {
+-        CUDAUploadSlot *u = &priv->up[priv->up_next];
+-        size_t off[4] = { 0 }, wb[4] = { 0 }, rows[4] = { 0 }, need = 0;
+-        int np = 0;
+-        priv->up_next = (priv->up_next + 1) % CUDA_UPLOAD_SLOTS;
+-        for (i = 0; i < FF_ARRAY_ELEMS(src->data) && i < 4 && src->data[i]; i++) {
+-            wb[i]   = FFMIN(src->linesize[i], dst->linesize[i]);
+-            rows[i] = AV_CEIL_RSHIFT(src->height, (i == 0 || i == 3) ? 0 : priv->shift_height);
+-            off[i]  = need;
+-            need   += FFALIGN(wb[i] * rows[i], 256);
+-            np = i + 1;
+-        }
+-        if (u->pending) {
+-            ret = CHECK_CU(cu->cuEventSynchronize(u->ev));
+-            if (ret < 0)
+-                goto exit;
+-            u->pending = 0;
+-        }
+-        if (u->size < need) {
+-            if (u->host)
+-                CHECK_CU(cu->cuMemFreeHost(u->host));
+-            u->host = NULL;
+-            u->size = 0;
+-            ret = CHECK_CU(cu->cuMemAllocHost((void **)&u->host, need));
+-            if (ret < 0)
+-                goto exit;
+-            u->size = need;
+-        }
+-        if (!u->ev) {
+-            ret = CHECK_CU(cu->cuEventCreate(&u->ev, CU_EVENT_DISABLE_TIMING));
+-            if (ret < 0)
+-                goto exit;
+-        }
+-        for (i = 0; i < np; i++) {
+-            CUDA_MEMCPY2D cpy = {
+-                .srcMemoryType = CU_MEMORYTYPE_HOST,
+-                .srcHost       = u->host + off[i],
+-                .srcPitch      = wb[i],
+-                .dstMemoryType = CU_MEMORYTYPE_DEVICE,
+-                .dstDevice     = (CUdeviceptr)dst->data[i],
+-                .dstPitch      = dst->linesize[i],
+-                .WidthInBytes  = wb[i],
+-                .Height        = rows[i],
+-            };
+-            av_image_copy_plane(u->host + off[i], wb[i], src->data[i], src->linesize[i], wb[i], rows[i]);
+-            ret = CHECK_CU(cu->cuMemcpy2DAsync(&cpy, hwctx->stream));
+-            if (ret < 0)
+-                goto exit;
+-        }
+-        ret = CHECK_CU(cu->cuEventRecord(u->ev, hwctx->stream));
+-        if (ret < 0)
+-            goto exit;
+-        u->pending = 1;
+-        goto exit;
+-    }
+-
++    /* CrabbyCut: KHÔNG tải lên qua bộ đệm ghim (bản đầu của phiên 9 có làm, đã bỏ 2026-10-02): luồng
++     * lọc chạy trước GPU thì lớp phủ/khung chính tải lên ra nội dung cũ ở vài khung (Bin Tom batch 3,
++     * cả khi ra FFV1), mà chép từ bộ nhớ thường không chậm hơn trên các phép đo (2,7 s / 2,7 s). */
+     for (i = 0; i < FF_ARRAY_ELEMS(src->data) && src->data[i]; i++) {
+         CUDA_MEMCPY2D cpy = {
+             .srcPitch      = src->linesize[i],
+@@ -380,11 +288,10 @@ static int cuda_transfer_data(AVHWFramesContext *ctx, AVFrame *dst,
+             goto exit;
+     }
+ 
+-    if (!dst->hw_frames_ctx) {
+-        ret = CHECK_CU(cu->cuStreamSynchronize(hwctx->stream));
+-        if (ret < 0)
+-            goto exit;
+-    }
++    /* CrabbyCut: chờ cả lúc TẢI LÊN (upstream chỉ chờ khi tải về) — trả về khi khung đã nằm trên
++     * GPU (xem `sync` của vf_crabgeo_cuda.c: không chờ thì lớp phủ chữ tải lên ra khung lệch thời
++     * gian khi máy bận). */
++    ret = CHECK_CU(cu->cuStreamSynchronize(hwctx->stream));
+ 
+ exit:
+     CHECK_CU(cu->cuCtxPopCurrent(&dummy));
+@@ -679,7 +586,6 @@ const HWContextType ff_hwcontext_type_cuda = {
+     .device_uninit        = cuda_device_uninit,
+     .frames_get_constraints = cuda_frames_get_constraints,
+     .frames_init          = cuda_frames_init,
+-    .frames_uninit        = cuda_frames_uninit,
+     .frames_get_buffer    = cuda_get_buffer,
+     .transfer_get_formats = cuda_transfer_get_formats,
+     .transfer_data_to     = cuda_transfer_data,

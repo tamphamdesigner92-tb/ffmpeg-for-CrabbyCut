@@ -1,0 +1,2206 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "Tam Pham (Windows)" <tampham.designer92@gmail.com>
+Date: Fri, 2 Oct 2026 10:16:39 +0700
+Subject: [PATCH 1/2] =?UTF-8?q?CrabbyCut:=20b=E1=BB=99=20l=E1=BB=8Dc=20CUD?=
+ =?UTF-8?q?A=20crabgeo=5Fcuda/crabblend=5Fcuda,=20v=C3=A1=20fftools/hwdown?=
+ =?UTF-8?q?load/hwcontext=5Fcuda=20cho=20GPU?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- crabgeo_cuda: cắt + co (bicubic như swscale, lọc tách được) + đổi ma trận/dải màu + đặt
+  vào khung, RGBA -> yuva420p (màu mép theo alpha); khai ma trận/dải riêng từng ngõ.
+- crabblend_cuda: trộn lớp phủ trùng từng bit với overlay=format=yuv420, thêm opacity.
+- fftools: không dựng lại đồ thị khi chỉ hw_frames_ctx đổi (cùng thiết bị/định dạng/cỡ).
+- hwdownload: nhận khung từ vùng nhớ tương thích.
+- hwcontext_cuda: chép hàng màu cuối khi cao lẻ; tải lên qua bộ đệm ghim (không chờ stream).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ configure                        |   4 +
+ fftools/ffmpeg_filter.c          |  28 +-
+ libavfilter/Makefile             |   2 +
+ libavfilter/allfilters.c         |   2 +
+ libavfilter/vf_crabblend_cuda.c  | 500 ++++++++++++++++
+ libavfilter/vf_crabblend_cuda.cu |  84 +++
+ libavfilter/vf_crabgeo_cuda.c    | 949 +++++++++++++++++++++++++++++++
+ libavfilter/vf_crabgeo_cuda.cu   | 310 ++++++++++
+ libavfilter/vf_crabgeo_cuda.h    |  42 ++
+ libavfilter/vf_hwdownload.c      |  16 +-
+ libavutil/hwcontext_cuda.c       | 100 +++-
+ 11 files changed, 2030 insertions(+), 7 deletions(-)
+ create mode 100644 libavfilter/vf_crabblend_cuda.c
+ create mode 100644 libavfilter/vf_crabblend_cuda.cu
+ create mode 100644 libavfilter/vf_crabgeo_cuda.c
+ create mode 100644 libavfilter/vf_crabgeo_cuda.cu
+ create mode 100644 libavfilter/vf_crabgeo_cuda.h
+
+diff --git a/configure b/configure
+index 1759694..9fc8485 100755
+--- a/configure
++++ b/configure
+@@ -3525,6 +3525,10 @@ thumbnail_cuda_filter_deps_any="cuda_nvcc cuda_llvm"
+ transpose_npp_filter_deps="ffnvcodec libnpp"
+ overlay_cuda_filter_deps="ffnvcodec"
+ overlay_cuda_filter_deps_any="cuda_nvcc cuda_llvm"
++crabgeo_cuda_filter_deps="ffnvcodec"
++crabgeo_cuda_filter_deps_any="cuda_nvcc cuda_llvm"
++crabblend_cuda_filter_deps="ffnvcodec"
++crabblend_cuda_filter_deps_any="cuda_nvcc cuda_llvm"
+ pad_cuda_filter_deps="ffnvcodec"
+ pad_cuda_filter_deps_any="cuda_nvcc cuda_llvm"
+ sharpen_npp_filter_deps="ffnvcodec libnpp"
+diff --git a/fftools/ffmpeg_filter.c b/fftools/ffmpeg_filter.c
+index 765b65d..9e26846 100644
+--- a/fftools/ffmpeg_filter.c
++++ b/fftools/ffmpeg_filter.c
+@@ -3075,6 +3075,20 @@ static const char *unknown_if_null(const char *str)
+     return str ? str : "unknown";
+ }
+ 
++/* CrabbyCut: hai vùng nhớ hw thay được cho nhau (xem send_frame) — cùng thiết bị, định dạng, cỡ. */
++static int hw_frames_compatible(const AVBufferRef *a, const AVBufferRef *b)
++{
++    const AVHWFramesContext *fa, *fb;
++    if (!a || !b)
++        return 0;
++    fa = (const AVHWFramesContext *)a->data;
++    fb = (const AVHWFramesContext *)b->data;
++    return fa->device_ref && fb->device_ref &&
++           fa->device_ref->data == fb->device_ref->data &&
++           fa->format == fb->format && fa->sw_format == fb->sw_format &&
++           fa->width == fb->width && fa->height == fb->height;
++}
++
+ static int send_frame(FilterGraph *fg, FilterGraphThread *fgt,
+                       InputFilter *ifilter, AVFrame *frame)
+ {
+@@ -3128,8 +3142,18 @@ static int send_frame(FilterGraph *fg, FilterGraphThread *fgt,
+         need_reinit = 0;
+ 
+     if (!!ifp->hw_frames_ctx != !!frame->hw_frames_ctx ||
+-        (ifp->hw_frames_ctx && ifp->hw_frames_ctx->data != frame->hw_frames_ctx->data))
+-        need_reinit |= HWACCEL_CHANGED;
++        (ifp->hw_frames_ctx && ifp->hw_frames_ctx->data != frame->hw_frames_ctx->data)) {
++        /* CrabbyCut: bộ giải mã phần cứng tạo vùng nhớ hw MỚI mỗi lần khởi tạo lại (sau khi tua,
++         * ở chỗ đổi SPS của file nối). Với -reinit_filter 0 mà vùng mới cùng thiết bị, định dạng
++         * và cỡ thì chỉ đổi tham chiếu — dựng lại đồ thị giữa chừng làm trim/concat mất trạng thái. */
++        if (!(ifp->opts.flags & IFILTER_FLAG_REINIT) && fgt->graph &&
++            hw_frames_compatible(ifp->hw_frames_ctx, frame->hw_frames_ctx)) {
++            ret = av_buffer_replace(&ifp->hw_frames_ctx, frame->hw_frames_ctx);
++            if (ret < 0)
++                return ret;
++        } else
++            need_reinit |= HWACCEL_CHANGED;
++    }
+ 
+     if (need_reinit) {
+         ret = ifilter_parameters_from_frame(ifilter, frame);
+diff --git a/libavfilter/Makefile b/libavfilter/Makefile
+index a530cfa..911da13 100644
+--- a/libavfilter/Makefile
++++ b/libavfilter/Makefile
+@@ -193,6 +193,8 @@ OBJS-$(CONFIG_WHISPER_FILTER)                += af_whisper.o
+ OBJS-$(CONFIG_ANULLSINK_FILTER)              += asink_anullsink.o
+ 
+ # video filters
++OBJS-$(CONFIG_CRABGEO_CUDA_FILTER)           += vf_crabgeo_cuda.o framesync.o vf_crabgeo_cuda.ptx.o cuda/load_helper.o
++OBJS-$(CONFIG_CRABBLEND_CUDA_FILTER)         += vf_crabblend_cuda.o framesync.o vf_crabblend_cuda.ptx.o cuda/load_helper.o
+ OBJS-$(CONFIG_ADDROI_FILTER)                 += vf_addroi.o
+ OBJS-$(CONFIG_ALPHAEXTRACT_FILTER)           += vf_extractplanes.o
+ OBJS-$(CONFIG_ALPHAMERGE_FILTER)             += vf_alphamerge.o framesync.o
+diff --git a/libavfilter/allfilters.c b/libavfilter/allfilters.c
+index e26859e..7948eec 100644
+--- a/libavfilter/allfilters.c
++++ b/libavfilter/allfilters.c
+@@ -399,6 +399,8 @@ extern const FFFilter ff_vf_overlay_qsv;
+ extern const FFFilter ff_vf_overlay_vaapi;
+ extern const FFFilter ff_vf_overlay_vulkan;
+ extern const FFFilter ff_vf_overlay_cuda;
++extern const FFFilter ff_vf_crabgeo_cuda;
++extern const FFFilter ff_vf_crabblend_cuda;
+ extern const FFFilter ff_vf_owdenoise;
+ extern const FFFilter ff_vf_pad;
+ extern const FFFilter ff_vf_pad_cuda;
+diff --git a/libavfilter/vf_crabblend_cuda.c b/libavfilter/vf_crabblend_cuda.c
+new file mode 100644
+index 0000000..a8389f3
+--- /dev/null
++++ b/libavfilter/vf_crabblend_cuda.c
+@@ -0,0 +1,500 @@
++/*
++ * CrabbyCut: trộn lớp phủ trên CUDA (thay cho `overlay=...:format=yuv420` của đường CPU).
++ *
++ * Khác overlay_cuda của FFmpeg:
++ *   - phép trộn y hệt vf_overlay (FAST_DIV255, alpha màu trung bình 2x2) -> trùng từng bit;
++ *   - x VÀ y làm tròn theo hạ mẫu màu như vf_overlay (overlay_cuda bỏ qua y);
++ *   - `opacity` (biểu thức, tính từng khung theo t) — keyframe độ mờ khỏi cần colorchannelmixer
++ *     (lệch bản CPU ±1 mức vì CPU nhân alpha trước khi hạ mẫu: PSNR 62 dB ở độ mờ 0,48);
++ *   - chỉ chép khung chính (GPU->GPU) khi lớp phủ thật sự hiện và khung đang dùng chung;
++ *   - lưới luồng chỉ phủ vùng lớp phủ.
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#include <math.h>
++
++#include "libavutil/avassert.h"
++#include "libavutil/cuda_check.h"
++#include "libavutil/eval.h"
++#include "libavutil/hwcontext.h"
++#include "libavutil/hwcontext_cuda_internal.h"
++#include "libavutil/log.h"
++#include "libavutil/mem.h"
++#include "libavutil/opt.h"
++#include "libavutil/pixdesc.h"
++
++#include "avfilter.h"
++#include "filters.h"
++#include "formats.h"
++#include "framesync.h"
++
++#include "cuda/load_helper.h"
++
++#define CHECK_CU(x) FF_CUDA_CHECK_DL(avctx, s->hwctx->internal->cuda_dl, x)
++#define DIV_UP(a, b) (((a) + (b) - 1) / (b))
++
++#define BLOCK_X 32
++#define BLOCK_Y 8
++
++enum var_name {
++    VAR_MAIN_W, VAR_MW, VAR_MAIN_H, VAR_MH,
++    VAR_OVERLAY_W, VAR_OW, VAR_OVERLAY_H, VAR_OH,
++    VAR_X, VAR_Y, VAR_N, VAR_T,
++    VAR_VARS_NB
++};
++
++static const char *const var_names[] = {
++    "main_w", "W", "main_h", "H",
++    "overlay_w", "w", "overlay_h", "h",
++    "x", "y", "n", "t",
++    NULL
++};
++
++enum EvalMode { EVAL_MODE_INIT, EVAL_MODE_FRAME, EVAL_MODE_NB };
++
++typedef struct CrabBlendCUDAContext {
++    const AVClass *class;
++
++    FFFrameSync fs;
++
++    enum AVPixelFormat main_fmt, overlay_fmt;
++    int hsub, vsub;          ///< hạ mẫu màu của khung chính (log2)
++    int overlay_alpha;       ///< lớp phủ có mặt phẳng alpha
++
++    AVBufferRef *hw_device_ctx;
++    AVCUDADeviceContext *hwctx;
++    CUmodule cu_module;
++    CUfunction cu_plane, cu_chroma420;
++    CUstream cu_stream;
++
++    char *x_expr, *y_expr, *opacity_expr;
++    AVExpr *x_pexpr, *y_pexpr, *opacity_pexpr;
++    double var_values[VAR_VARS_NB];
++    int eval_mode;
++    int x, y;
++    int opacity255;
++} CrabBlendCUDAContext;
++
++static const enum AVPixelFormat main_formats[] = {
++    AV_PIX_FMT_YUV420P, AV_PIX_FMT_YUV444P, AV_PIX_FMT_NONE,
++};
++
++static int overlay_format_ok(enum AVPixelFormat main, enum AVPixelFormat ov)
++{
++    switch (main) {
++    case AV_PIX_FMT_YUV420P: return ov == AV_PIX_FMT_YUV420P || ov == AV_PIX_FMT_YUVA420P;
++    case AV_PIX_FMT_YUV444P: return ov == AV_PIX_FMT_YUV444P || ov == AV_PIX_FMT_YUVA444P;
++    default:                 return 0;
++    }
++}
++
++/* vf_overlay normalize_xy: cắt về số nguyên rồi xoá bit thấp theo hạ mẫu màu. */
++static inline int normalize_xy(double d, int chroma_sub)
++{
++    if (isnan(d))
++        return INT_MAX;
++    return (int)d & ~((1 << chroma_sub) - 1);
++}
++
++static void eval_expr(AVFilterContext *avctx)
++{
++    CrabBlendCUDAContext *s = avctx->priv;
++    double op;
++
++    s->var_values[VAR_X] = av_expr_eval(s->x_pexpr, s->var_values, NULL);
++    s->var_values[VAR_Y] = av_expr_eval(s->y_pexpr, s->var_values, NULL);
++    s->var_values[VAR_X] = av_expr_eval(s->x_pexpr, s->var_values, NULL);
++    s->x = normalize_xy(s->var_values[VAR_X], s->hsub);
++    s->y = normalize_xy(s->var_values[VAR_Y], s->vsub);
++
++    op = av_expr_eval(s->opacity_pexpr, s->var_values, NULL);
++    if (isnan(op))
++        op = 1.0;
++    op = av_clipd(op, 0.0, 1.0);
++    s->opacity255 = (int)lrint(op * 255.0);
++}
++
++static int set_expr(AVExpr **pexpr, const char *expr, const char *option, void *log_ctx)
++{
++    AVExpr *old = *pexpr;
++    int ret = av_expr_parse(pexpr, expr, var_names, NULL, NULL, NULL, NULL, 0, log_ctx);
++    if (ret < 0) {
++        av_log(log_ctx, AV_LOG_ERROR, "Error when parsing the expression '%s' for %s\n", expr, option);
++        *pexpr = old;
++        return ret;
++    }
++    av_expr_free(old);
++    return 0;
++}
++
++static int launch(AVFilterContext *avctx, CUfunction func, int w, int h, void **args)
++{
++    CrabBlendCUDAContext *s = avctx->priv;
++    CudaFunctions *cu = s->hwctx->internal->cuda_dl;
++    if (w <= 0 || h <= 0)
++        return 0;
++    return CHECK_CU(cu->cuLaunchKernel(func, DIV_UP(w, BLOCK_X), DIV_UP(h, BLOCK_Y), 1,
++                                       BLOCK_X, BLOCK_Y, 1, 0, s->cu_stream, args, NULL));
++}
++
++/* Một mặt phẳng: giới hạn theo toạ độ lớp phủ, cắt theo khung chính — cùng vùng với vf_overlay
++ * (ở đó jmax là SỐ hàng của lát, không phải chỉ số cuối). Mặt phẳng màu 4:2:0 lấy alpha ở cỡ luma. */
++static int blend_plane(AVFilterContext *avctx, AVFrame *dst, const AVFrame *src, int plane,
++                       int sub_x, int sub_y)
++{
++    CrabBlendCUDAContext *s = avctx->priv;
++    const int src_wp = AV_CEIL_RSHIFT(src->width,  sub_x);
++    const int src_hp = AV_CEIL_RSHIFT(src->height, sub_y);
++    const int dst_wp = AV_CEIL_RSHIFT(dst->width,  sub_x);
++    const int dst_hp = AV_CEIL_RSHIFT(dst->height, sub_y);
++    int xp = s->x >> sub_x;
++    int yp = s->y >> sub_y;
++    int k0 = FFMAX(-xp, 0), k1 = FFMIN(dst_wp - xp, src_wp);
++    int j0 = FFMAX(-yp, 0), j1 = FFMIN(dst_hp - yp, src_hp);
++    CUdeviceptr d = (CUdeviceptr)dst->data[plane];
++    CUdeviceptr sp = (CUdeviceptr)src->data[plane];
++    CUdeviceptr a = s->overlay_alpha ? (CUdeviceptr)src->data[3] : 0;
++    int dl = dst->linesize[plane], sl = src->linesize[plane];
++    int al = s->overlay_alpha ? src->linesize[3] : 0;
++    int op = s->opacity255;
++
++    if (k1 <= k0 || j1 <= j0)
++        return 0;
++    if (sub_x || sub_y) {
++        void *args[] = { &d, &dl, &sp, &sl, &a, &al, &xp, &yp, &k0, &k1, &j0, &j1,
++                         (void *)&src_wp, (void *)&src_hp, &op };
++        return launch(avctx, s->cu_chroma420, k1 - k0, j1 - j0, args);
++    } else {
++        void *args[] = { &d, &dl, &sp, &sl, &a, &al, &xp, &yp, &k0, &k1, &j0, &j1, &op };
++        return launch(avctx, s->cu_plane, k1 - k0, j1 - j0, args);
++    }
++}
++
++/* Khung chính đang dùng chung (framesync/tpad giữ tham chiếu) -> chép sang bộ đệm mới trên GPU. */
++static int make_writable(AVFilterContext *avctx, AVFrame **pframe)
++{
++    CrabBlendCUDAContext *s = avctx->priv;
++    CudaFunctions *cu = s->hwctx->internal->cuda_dl;
++    AVFrame *src = *pframe, *out;
++    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(s->main_fmt);
++    int ret;
++
++    if (av_frame_is_writable(src))
++        return 0;
++    out = av_frame_alloc();
++    if (!out)
++        return AVERROR(ENOMEM);
++    ret = av_hwframe_get_buffer(src->hw_frames_ctx, out, 0);
++    if (ret < 0)
++        goto fail;
++    ret = av_frame_copy_props(out, src);
++    if (ret < 0)
++        goto fail;
++    for (int i = 0; i < av_pix_fmt_count_planes(s->main_fmt); i++) {
++        int sx = (i == 1 || i == 2) ? desc->log2_chroma_w : 0;
++        int sy = (i == 1 || i == 2) ? desc->log2_chroma_h : 0;
++        CUDA_MEMCPY2D cpy = {
++            .srcMemoryType = CU_MEMORYTYPE_DEVICE,
++            .srcDevice     = (CUdeviceptr)src->data[i],
++            .srcPitch      = src->linesize[i],
++            .dstMemoryType = CU_MEMORYTYPE_DEVICE,
++            .dstDevice     = (CUdeviceptr)out->data[i],
++            .dstPitch      = out->linesize[i],
++            .WidthInBytes  = AV_CEIL_RSHIFT(src->width, sx),
++            .Height        = AV_CEIL_RSHIFT(src->height, sy),
++        };
++        ret = CHECK_CU(cu->cuMemcpy2DAsync(&cpy, s->cu_stream));
++        if (ret < 0)
++            goto fail;
++    }
++    av_frame_free(pframe);
++    *pframe = out;
++    return 0;
++fail:
++    av_frame_free(&out);
++    return ret;
++}
++
++static int do_blend(FFFrameSync *fs)
++{
++    AVFilterContext *avctx = fs->parent;
++    CrabBlendCUDAContext *s = avctx->priv;
++    AVFilterLink *inlink = avctx->inputs[0];
++    FilterLink *inl = ff_filter_link(inlink);
++    CudaFunctions *cu = s->hwctx->internal->cuda_dl;
++    CUcontext dummy;
++    AVFrame *mainpic, *second;
++    int ret;
++
++    ret = ff_framesync_dualinput_get(fs, &mainpic, &second);
++    if (ret < 0)
++        return ret;
++    if (!second)
++        return ff_filter_frame(avctx->outputs[0], mainpic);
++
++    if (s->eval_mode == EVAL_MODE_FRAME) {
++        s->var_values[VAR_N] = inl->frame_count_out;
++        s->var_values[VAR_T] = mainpic->pts == AV_NOPTS_VALUE ?
++            NAN : mainpic->pts * av_q2d(inlink->time_base);
++        s->var_values[VAR_OVERLAY_W] = s->var_values[VAR_OW] = second->width;
++        s->var_values[VAR_OVERLAY_H] = s->var_values[VAR_OH] = second->height;
++        s->var_values[VAR_MAIN_W]    = s->var_values[VAR_MW] = mainpic->width;
++        s->var_values[VAR_MAIN_H]    = s->var_values[VAR_MH] = mainpic->height;
++        eval_expr(avctx);
++    }
++
++    if (s->opacity255 <= 0 ||
++        !(s->x < mainpic->width && s->x + second->width >= 0 &&
++          s->y < mainpic->height && s->y + second->height >= 0))
++        return ff_filter_frame(avctx->outputs[0], mainpic);
++
++    ret = CHECK_CU(cu->cuCtxPushCurrent(s->hwctx->cuda_ctx));
++    if (ret < 0)
++        goto fail;
++    ret = make_writable(avctx, &mainpic);
++    if (ret >= 0)
++        ret = blend_plane(avctx, mainpic, second, 0, 0, 0);
++    if (ret >= 0)
++        ret = blend_plane(avctx, mainpic, second, 1, s->hsub, s->vsub);
++    if (ret >= 0)
++        ret = blend_plane(avctx, mainpic, second, 2, s->hsub, s->vsub);
++    CHECK_CU(cu->cuCtxPopCurrent(&dummy));
++    if (ret < 0)
++        goto fail;
++    return ff_filter_frame(avctx->outputs[0], mainpic);
++fail:
++    av_frame_free(&mainpic);
++    return ret;
++}
++
++static int config_input_overlay(AVFilterLink *inlink)
++{
++    AVFilterContext *avctx = inlink->dst;
++    CrabBlendCUDAContext *s = avctx->priv;
++    int ret;
++
++    s->var_values[VAR_MAIN_W]    = s->var_values[VAR_MW] = avctx->inputs[0]->w;
++    s->var_values[VAR_MAIN_H]    = s->var_values[VAR_MH] = avctx->inputs[0]->h;
++    s->var_values[VAR_OVERLAY_W] = s->var_values[VAR_OW] = avctx->inputs[1]->w;
++    s->var_values[VAR_OVERLAY_H] = s->var_values[VAR_OH] = avctx->inputs[1]->h;
++    s->var_values[VAR_X] = s->var_values[VAR_Y] = NAN;
++    s->var_values[VAR_N] = 0;
++    s->var_values[VAR_T] = NAN;
++
++    if ((ret = set_expr(&s->x_pexpr, s->x_expr, "x", avctx)) < 0 ||
++        (ret = set_expr(&s->y_pexpr, s->y_expr, "y", avctx)) < 0 ||
++        (ret = set_expr(&s->opacity_pexpr, s->opacity_expr, "opacity", avctx)) < 0)
++        return ret;
++    if (s->eval_mode == EVAL_MODE_INIT)
++        eval_expr(avctx);
++    return 0;
++}
++
++static int config_output(AVFilterLink *outlink)
++{
++    extern const unsigned char ff_vf_crabblend_cuda_ptx_data[];
++    extern const unsigned int ff_vf_crabblend_cuda_ptx_len;
++
++    AVFilterContext *avctx = outlink->src;
++    CrabBlendCUDAContext *s = avctx->priv;
++    FilterLink *outl = ff_filter_link(outlink);
++    FilterLink *inl  = ff_filter_link(avctx->inputs[0]);
++    FilterLink *ovl  = ff_filter_link(avctx->inputs[1]);
++    AVHWFramesContext *main_fc, *ov_fc;
++    const AVPixFmtDescriptor *desc;
++    CudaFunctions *cu;
++    CUcontext dummy;
++    int ret;
++
++    if (!inl->hw_frames_ctx || !ovl->hw_frames_ctx) {
++        av_log(avctx, AV_LOG_ERROR, "Both inputs must be CUDA frames\n");
++        return AVERROR(EINVAL);
++    }
++    main_fc = (AVHWFramesContext *)inl->hw_frames_ctx->data;
++    ov_fc   = (AVHWFramesContext *)ovl->hw_frames_ctx->data;
++    s->main_fmt = main_fc->sw_format;
++    s->overlay_fmt = ov_fc->sw_format;
++    {
++        int ok = 0;
++        for (int i = 0; main_formats[i] != AV_PIX_FMT_NONE; i++)
++            ok |= main_formats[i] == s->main_fmt;
++        if (!ok || !overlay_format_ok(s->main_fmt, s->overlay_fmt)) {
++            av_log(avctx, AV_LOG_ERROR, "Can't blend %s on %s\n",
++                   av_get_pix_fmt_name(s->overlay_fmt), av_get_pix_fmt_name(s->main_fmt));
++            return AVERROR(ENOSYS);
++        }
++    }
++    desc = av_pix_fmt_desc_get(s->main_fmt);
++    s->hsub = desc->log2_chroma_w;
++    s->vsub = desc->log2_chroma_h;
++    s->overlay_alpha = !!(av_pix_fmt_desc_get(s->overlay_fmt)->flags & AV_PIX_FMT_FLAG_ALPHA);
++
++    s->hw_device_ctx = av_buffer_ref(main_fc->device_ref);
++    if (!s->hw_device_ctx)
++        return AVERROR(ENOMEM);
++    s->hwctx = ((AVHWDeviceContext *)s->hw_device_ctx->data)->hwctx;
++    s->cu_stream = s->hwctx->stream;
++    cu = s->hwctx->internal->cuda_dl;
++
++    outl->hw_frames_ctx = av_buffer_ref(inl->hw_frames_ctx);
++    if (!outl->hw_frames_ctx)
++        return AVERROR(ENOMEM);
++
++    ret = CHECK_CU(cu->cuCtxPushCurrent(s->hwctx->cuda_ctx));
++    if (ret < 0)
++        return ret;
++    ret = ff_cuda_load_module(avctx, s->hwctx, &s->cu_module,
++                              ff_vf_crabblend_cuda_ptx_data, ff_vf_crabblend_cuda_ptx_len);
++    if (ret >= 0)
++        ret = CHECK_CU(cu->cuModuleGetFunction(&s->cu_plane, s->cu_module, "CrabBlend_Plane"));
++    if (ret >= 0)
++        ret = CHECK_CU(cu->cuModuleGetFunction(&s->cu_chroma420, s->cu_module, "CrabBlend_Chroma420"));
++    CHECK_CU(cu->cuCtxPopCurrent(&dummy));
++    if (ret < 0)
++        return ret;
++
++    s->fs.time_base = avctx->inputs[0]->time_base;
++    ret = ff_framesync_init_dualinput(&s->fs, avctx);
++    if (ret < 0)
++        return ret;
++    return ff_framesync_configure(&s->fs);
++}
++
++static av_cold int crabblend_init(AVFilterContext *avctx)
++{
++    CrabBlendCUDAContext *s = avctx->priv;
++    s->fs.on_event = do_blend;
++    s->opacity255 = 255;
++    return 0;
++}
++
++static av_cold void crabblend_uninit(AVFilterContext *avctx)
++{
++    CrabBlendCUDAContext *s = avctx->priv;
++
++    ff_framesync_uninit(&s->fs);
++    if (s->hwctx && s->cu_module) {
++        CudaFunctions *cu = s->hwctx->internal->cuda_dl;
++        CUcontext dummy;
++        CHECK_CU(cu->cuCtxPushCurrent(s->hwctx->cuda_ctx));
++        CHECK_CU(cu->cuModuleUnload(s->cu_module));
++        CHECK_CU(cu->cuCtxPopCurrent(&dummy));
++    }
++    av_expr_free(s->x_pexpr);       s->x_pexpr = NULL;
++    av_expr_free(s->y_pexpr);       s->y_pexpr = NULL;
++    av_expr_free(s->opacity_pexpr); s->opacity_pexpr = NULL;
++    av_buffer_unref(&s->hw_device_ctx);
++    s->hwctx = NULL;
++}
++
++static int crabblend_activate(AVFilterContext *avctx)
++{
++    CrabBlendCUDAContext *s = avctx->priv;
++    return ff_framesync_activate(&s->fs);
++}
++
++static int process_command(AVFilterContext *avctx, const char *cmd, const char *args,
++                           char *res, int res_len, int flags)
++{
++    CrabBlendCUDAContext *s = avctx->priv;
++    int ret;
++
++    if (!strcmp(cmd, "x"))
++        ret = set_expr(&s->x_pexpr, args, cmd, avctx);
++    else if (!strcmp(cmd, "y"))
++        ret = set_expr(&s->y_pexpr, args, cmd, avctx);
++    else if (!strcmp(cmd, "opacity"))
++        ret = set_expr(&s->opacity_pexpr, args, cmd, avctx);
++    else
++        return AVERROR(ENOSYS);
++    if (ret < 0)
++        return ret;
++    if (s->eval_mode == EVAL_MODE_INIT)
++        eval_expr(avctx);
++    return 0;
++}
++
++/* Khung chính và khung ra chung ma trận/dải; lớp phủ riêng (crabgeo đã đổi nó về bt709/tv). */
++static int crabblend_query_formats(const AVFilterContext *avctx, AVFilterFormatsConfig **cfg_in,
++                                   AVFilterFormatsConfig **cfg_out)
++{
++    static const enum AVPixelFormat pix[] = { AV_PIX_FMT_CUDA, AV_PIX_FMT_NONE };
++    AVFilterFormats *cs = ff_all_color_spaces(), *cr = ff_all_color_ranges();
++    int ret;
++    if ((ret = ff_formats_ref(ff_make_format_list(pix), &cfg_in[0]->formats)) < 0 ||
++        (ret = ff_formats_ref(ff_make_format_list(pix), &cfg_in[1]->formats)) < 0 ||
++        (ret = ff_formats_ref(ff_make_format_list(pix), &cfg_out[0]->formats)) < 0 ||
++        (ret = ff_formats_ref(cs, &cfg_in[0]->color_spaces)) < 0 ||
++        (ret = ff_formats_ref(cs, &cfg_out[0]->color_spaces)) < 0 ||
++        (ret = ff_formats_ref(cr, &cfg_in[0]->color_ranges)) < 0 ||
++        (ret = ff_formats_ref(cr, &cfg_out[0]->color_ranges)) < 0 ||
++        (ret = ff_formats_ref(ff_all_color_spaces(), &cfg_in[1]->color_spaces)) < 0 ||
++        (ret = ff_formats_ref(ff_all_color_ranges(), &cfg_in[1]->color_ranges)) < 0)
++        return ret;
++    return 0;
++}
++
++#define OFFSET(x) offsetof(CrabBlendCUDAContext, x)
++#define FLAGS (AV_OPT_FLAG_FILTERING_PARAM | AV_OPT_FLAG_VIDEO_PARAM)
++#define TFLAGS (FLAGS | AV_OPT_FLAG_RUNTIME_PARAM)
++
++static const AVOption crabblend_cuda_options[] = {
++    { "x", "x expression of the overlay", OFFSET(x_expr), AV_OPT_TYPE_STRING, { .str = "0" }, 0, 0, TFLAGS },
++    { "y", "y expression of the overlay", OFFSET(y_expr), AV_OPT_TYPE_STRING, { .str = "0" }, 0, 0, TFLAGS },
++    { "opacity", "opacity expression (0..1)", OFFSET(opacity_expr), AV_OPT_TYPE_STRING, { .str = "1" }, 0, 0, TFLAGS },
++    { "eof_action", "Action to take when encountering EOF from secondary input ",
++        OFFSET(fs.opt_eof_action), AV_OPT_TYPE_INT, { .i64 = EOF_ACTION_REPEAT },
++        EOF_ACTION_REPEAT, EOF_ACTION_PASS, .flags = FLAGS, .unit = "eof_action" },
++        { "repeat", "Repeat the previous frame.",   0, AV_OPT_TYPE_CONST, { .i64 = EOF_ACTION_REPEAT }, .flags = FLAGS, .unit = "eof_action" },
++        { "endall", "End both streams.",            0, AV_OPT_TYPE_CONST, { .i64 = EOF_ACTION_ENDALL }, .flags = FLAGS, .unit = "eof_action" },
++        { "pass",   "Pass through the main input.", 0, AV_OPT_TYPE_CONST, { .i64 = EOF_ACTION_PASS },   .flags = FLAGS, .unit = "eof_action" },
++    { "eval", "specify when to evaluate expressions", OFFSET(eval_mode), AV_OPT_TYPE_INT, { .i64 = EVAL_MODE_FRAME }, 0, EVAL_MODE_NB - 1, FLAGS, .unit = "eval" },
++        { "init",  "eval expressions once during initialization", 0, AV_OPT_TYPE_CONST, { .i64 = EVAL_MODE_INIT },  .flags = FLAGS, .unit = "eval" },
++        { "frame", "eval expressions per-frame",                  0, AV_OPT_TYPE_CONST, { .i64 = EVAL_MODE_FRAME }, .flags = FLAGS, .unit = "eval" },
++    { "shortest", "force termination when the shortest input terminates", OFFSET(fs.opt_shortest), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, FLAGS },
++    { "repeatlast", "repeat overlay of the last overlay frame", OFFSET(fs.opt_repeatlast), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, FLAGS },
++    { NULL },
++};
++
++FRAMESYNC_DEFINE_CLASS(crabblend_cuda, CrabBlendCUDAContext, fs);
++
++static const AVFilterPad crabblend_cuda_inputs[] = {
++    { .name = "main",    .type = AVMEDIA_TYPE_VIDEO },
++    { .name = "overlay", .type = AVMEDIA_TYPE_VIDEO, .config_props = config_input_overlay },
++};
++
++static const AVFilterPad crabblend_cuda_outputs[] = {
++    { .name = "default", .type = AVMEDIA_TYPE_VIDEO, .config_props = config_output },
++};
++
++const FFFilter ff_vf_crabblend_cuda = {
++    .p.name          = "crabblend_cuda",
++    .p.description   = NULL_IF_CONFIG_SMALL("CrabbyCut: blend an overlay onto the main video using CUDA"),
++    .p.priv_class    = &crabblend_cuda_class,
++    .p.flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_INTERNAL,
++    .priv_size       = sizeof(CrabBlendCUDAContext),
++    .preinit         = crabblend_cuda_framesync_preinit,
++    .init            = crabblend_init,
++    .uninit          = crabblend_uninit,
++    .activate        = crabblend_activate,
++    .process_command = process_command,
++    FILTER_INPUTS(crabblend_cuda_inputs),
++    FILTER_OUTPUTS(crabblend_cuda_outputs),
++    FILTER_QUERY_FUNC2(crabblend_query_formats),
++    .flags_internal  = FF_FILTER_FLAG_HWFRAME_AWARE,
++};
+diff --git a/libavfilter/vf_crabblend_cuda.cu b/libavfilter/vf_crabblend_cuda.cu
+new file mode 100644
+index 0000000..d81c8cc
+--- /dev/null
++++ b/libavfilter/vf_crabblend_cuda.cu
+@@ -0,0 +1,84 @@
++/*
++ * CrabbyCut: trộn lớp phủ lên khung chính trên CUDA — đúng phép nguyên của vf_overlay (CPU) ở
++ * chế độ alpha thẳng (straight), để bản xuất GPU trùng từng bit với bản CPU khi đầu vào giống nhau:
++ *   d = FAST_DIV255(d * (255 - a) + s * a)
++ * mặt phẳng màu 4:2:0 lấy alpha TRUNG BÌNH của khối 2x2 (mép phải/dưới lấy nửa khối) như
++ * blend_plane_8_8bits. Thêm `opacity255`: a = FAST_DIV255(a * opacity255) (255 = giữ nguyên a).
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++extern "C" {
++
++__device__ static inline int fast_div255(int x)
++{
++    return ((x + 128) * 257) >> 16;
++}
++
++/* Mặt phẳng không hạ mẫu so với alpha (luma, hoặc mọi mặt phẳng ở 4:4:4).
++ * Lưới luồng phủ [k0,k1) x [j0,j1) theo toạ độ LỚP PHỦ; (xp, yp) = vị trí lớp phủ trên mặt phẳng. */
++__global__ void CrabBlend_Plane(
++    unsigned char *dst, int dst_linesize,
++    const unsigned char *src, int src_linesize,
++    const unsigned char *alpha, int alpha_linesize,
++    int xp, int yp, int k0, int k1, int j0, int j1,
++    int opacity255)
++{
++    int k = k0 + blockIdx.x * blockDim.x + threadIdx.x;
++    int j = j0 + blockIdx.y * blockDim.y + threadIdx.y;
++    if (k >= k1 || j >= j1)
++        return;
++    int a = alpha ? alpha[j * alpha_linesize + k] : 255;
++    if (opacity255 != 255)
++        a = fast_div255(a * opacity255);
++    unsigned char *d = dst + (yp + j) * dst_linesize + (xp + k);
++    int s = src[j * src_linesize + k];
++    *d = (unsigned char)fast_div255(*d * (255 - a) + s * a);
++}
++
++/* Mặt phẳng màu 4:2:0. (k, j) theo toạ độ màu của lớp phủ; src_wp/src_hp = cỡ mặt phẳng màu
++ * của lớp phủ (làm tròn lên) — điều kiện mép y như vf_overlay. */
++__global__ void CrabBlend_Chroma420(
++    unsigned char *dst, int dst_linesize,
++    const unsigned char *src, int src_linesize,
++    const unsigned char *alpha, int alpha_linesize,
++    int xp, int yp, int k0, int k1, int j0, int j1,
++    int src_wp, int src_hp, int opacity255)
++{
++    int k = k0 + blockIdx.x * blockDim.x + threadIdx.x;
++    int j = j0 + blockIdx.y * blockDim.y + threadIdx.y;
++    if (k >= k1 || j >= j1)
++        return;
++    int al = 255;
++    if (alpha) {
++        const unsigned char *a = alpha + (j << 1) * alpha_linesize + (k << 1);
++        if (j + 1 < src_hp && k + 1 < src_wp) {
++            al = (a[0] + a[alpha_linesize] + a[1] + a[alpha_linesize + 1]) >> 2;
++        } else {
++            int ah = (k + 1 < src_wp) ? (a[0] + a[1]) >> 1 : a[0];
++            int av = (j + 1 < src_hp) ? (a[0] + a[alpha_linesize]) >> 1 : a[0];
++            al = (av + ah) >> 1;
++        }
++    }
++    if (opacity255 != 255)
++        al = fast_div255(al * opacity255);
++    unsigned char *d = dst + (yp + j) * dst_linesize + (xp + k);
++    int s = src[j * src_linesize + k];
++    *d = (unsigned char)fast_div255(*d * (255 - al) + s * al);
++}
++
++}
+diff --git a/libavfilter/vf_crabgeo_cuda.c b/libavfilter/vf_crabgeo_cuda.c
+new file mode 100644
+index 0000000..056a5c0
+--- /dev/null
++++ b/libavfilter/vf_crabgeo_cuda.c
+@@ -0,0 +1,949 @@
++/*
++ * CrabbyCut: hình học + đổi màu trên CUDA trong một bộ lọc (thay cho chuỗi
++ * crop/scale/format/pad/crop/scale(out_color_matrix) của đường CPU) — kernel ở vf_crabgeo_cuda.cu.
++ *
++ * Tuỳ chọn (biểu thức tính MỘT lần lúc cấu hình):
++ *   crop_x/crop_y/crop_w/crop_h  vùng cắt trên nguồn (số thực; biến iw, ih)
++ *   w, h                         cỡ ảnh nội dung sau co (biến iw, ih, crop_w, crop_h)
++ *   ow, oh                       cỡ khung ra (biến w, h, iw, ih); mặc định = w, h
++ *   x, y                         vị trí nội dung trên khung ra (số thực; biến W, H, w, h, iw, ih)
++ *   format                       yuv420p yuv444p yuva420p nv12 p010le
++ *   bg                           nền: black | transparent
++ *   interp                       bicubic (B=0 C=0.6 như swscale) | bilinear | nearest
++ *   out_matrix/out_range         ma trận/dải màu ra (mặc định bt709/tv)
++ *   in_matrix/in_range           ép ma trận/dải nguồn (mặc định theo nhãn khung; thiếu nhãn ->
++ *                                bt601/tv như swscale)
++ *   alpha_chroma                 màu 4:2:0 của nguồn RGBA = trung bình theo trọng số alpha
++ *   passthrough                  không đổi gì thì trả nguyên khung (0 = luôn chép sang vùng nhớ
++ *                                của bộ lọc, vd. để NVENC chỉ thấy MỘT vùng nhớ)
++ *
++ * Mô hình toạ độ: tâm điểm ảnh luma i ở i + 0.5. Mẫu ra thứ i của một mặt phẳng nằm ở
++ * off + i*sub (toạ độ luma khung ra); ánh xạ sang nguồn: crop + (X - pos) * ratio; rồi sang chỉ
++ * số mặt phẳng nguồn (X_src - off_src) / sub_src. Lọc tách được: bảng trọng số ngang/dọc tính
++ * một lần (chỉ dựng lại khi vị trí mẫu màu của nguồn đổi).
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#include <math.h>
++#include <string.h>
++
++#include "libavutil/avassert.h"
++#include "libavutil/cuda_check.h"
++#include "libavutil/eval.h"
++#include "libavutil/hwcontext.h"
++#include "libavutil/hwcontext_cuda_internal.h"
++#include "libavutil/log.h"
++#include "libavutil/mem.h"
++#include "libavutil/opt.h"
++#include "libavutil/pixdesc.h"
++
++#include "avfilter.h"
++#include "filters.h"
++#include "formats.h"
++#include "video.h"
++
++#include "cuda/load_helper.h"
++#include "vf_crabgeo_cuda.h"
++
++#define CHECK_CU(x) FF_CUDA_CHECK_DL(avctx, s->hwctx->internal->cuda_dl, x)
++#define DIV_UP(a, b) (((a) + (b) - 1) / (b))
++#define BLOCK_X 32
++#define BLOCK_Y 8
++
++enum { BG_BLACK, BG_TRANSPARENT };
++enum { MAT_AUTO = -1, MAT_BT601, MAT_BT709, MAT_BT2020 };
++enum { RNG_AUTO = -1, RNG_TV, RNG_PC };
++
++static const enum AVPixelFormat in_formats[] = {
++    AV_PIX_FMT_NV12, AV_PIX_FMT_YUV420P, AV_PIX_FMT_YUV444P, AV_PIX_FMT_P010, AV_PIX_FMT_P016,
++    AV_PIX_FMT_YUVA420P, AV_PIX_FMT_YUV444P16, AV_PIX_FMT_RGBA, AV_PIX_FMT_BGRA,
++    AV_PIX_FMT_RGB0, AV_PIX_FMT_BGR0, AV_PIX_FMT_NONE,
++};
++static const enum AVPixelFormat out_formats[] = {
++    AV_PIX_FMT_YUV420P, AV_PIX_FMT_YUV444P, AV_PIX_FMT_YUVA420P, AV_PIX_FMT_NV12, AV_PIX_FMT_P010,
++    AV_PIX_FMT_NONE,
++};
++
++/* Bảng một trục: `len` mẫu ra x `taps` tap; idx[i*taps] < 0 = mẫu ra ngoài nội dung.
++ * qmin/qmax: khoảng chỉ số nguồn mà các mẫu trong nội dung dùng tới. */
++typedef struct AxisTable {
++    int len, taps, qmin, qmax;
++    CUdeviceptr idx, w;
++} AxisTable;
++
++enum { FN_HPASS8, FN_HPASS16, FN_VOUT8, FN_VOUT16, FN_VF, FN_COPY11, FN_COPY12, FN_COPY21, FN_COPY22,
++       FN_FILLA, FN_YUVL, FN_YUVC, FN_RGBL, FN_RGBC, FN_NB };
++static const char *const fn_names[FN_NB] = {
++    "CrabGeo_HPass8", "CrabGeo_HPass16", "CrabGeo_VPassOut8", "CrabGeo_VPassOut16", "CrabGeo_VPassF",
++    "CrabGeo_Copy_1_1", "CrabGeo_Copy_1_2", "CrabGeo_Copy_2_1", "CrabGeo_Copy_2_2", "CrabGeo_FillAlpha",
++    "CrabGeo_ConvYUVLuma", "CrabGeo_ConvYUVChroma", "CrabGeo_ConvRGBLuma", "CrabGeo_ConvRGBChroma",
++};
++
++/* Chép thẳng một mặt phẳng: mẫu ra (i, j) <- nguồn (i - dx, j - dy) khi i in [x0,x1), j in [y0,y1). */
++typedef struct CopyPlan {
++    int ok, dx, dy, x0, x1, y0, y1;
++} CopyPlan;
++
++typedef struct CrabGeoCUDAContext {
++    const AVClass *class;
++
++    AVBufferRef *frames_ctx;      ///< vùng nhớ ra
++    AVCUDADeviceContext *hwctx;
++    CUmodule cu_module;
++    CUfunction fn[FN_NB];
++    CUstream cu_stream;
++
++    enum AVPixelFormat in_fmt, out_fmt;
++    char *w_expr, *h_expr, *ow_expr, *oh_expr, *x_expr, *y_expr;
++    char *cx_expr, *cy_expr, *cw_expr, *ch_expr;
++    double crop_x, crop_y, crop_w, crop_h;
++    int w, h, ow, oh;
++    double x, y;
++    int bg, interp, out_matrix, out_range, in_matrix, in_range;
++    int alpha_chroma, passthrough;
++    int passthrough_geom;
++
++    /* dựng từ định dạng/cỡ */
++    int src_rgb, src_alpha, dst_alpha;
++    int src_sx, src_sy;           ///< log2 hạ mẫu màu nguồn
++    int dst_sx, dst_sy;           ///< log2 hạ mẫu màu ra
++    int iw, ih, out_cw, out_ch;
++    AxisTable lx, ly, cx, cy;     ///< luma ra <- luma nguồn; màu ra <- màu nguồn
++    CopyPlan copy_l, copy_c;      ///< chép thẳng luma / màu (tỉ lệ 1:1, độ dời nguyên)
++    int tables_loc;               ///< vị trí mẫu màu nguồn mà bảng cx/cy đang dựng theo (-1: chưa)
++    CUdeviceptr hbuf;
++    size_t hbuf_size;
++    CUdeviceptr fplane[4];        ///< mặt phẳng float trung gian (đổi màu)
++    size_t fplane_size[4];
++} CrabGeoCUDAContext;
++
++static int fmt_in_list(const enum AVPixelFormat *list, enum AVPixelFormat f)
++{
++    for (int i = 0; list[i] != AV_PIX_FMT_NONE; i++)
++        if (list[i] == f)
++            return 1;
++    return 0;
++}
++
++static int eval_one(AVFilterContext *avctx, const char *expr, const char *const *names,
++                    const double *vals, double *out, const char *what)
++{
++    int ret = av_expr_parse_and_eval(out, expr, names, vals, NULL, NULL, NULL, NULL, NULL, 0, avctx);
++    if (ret < 0)
++        av_log(avctx, AV_LOG_ERROR, "Invalid expression '%s' for %s\n", expr, what);
++    return ret;
++}
++
++static void free_axis(AVFilterContext *avctx, AxisTable *t)
++{
++    CrabGeoCUDAContext *s = avctx->priv;
++    CudaFunctions *cu = s->hwctx->internal->cuda_dl;
++    if (t->idx)
++        CHECK_CU(cu->cuMemFree(t->idx));
++    if (t->w)
++        CHECK_CU(cu->cuMemFree(t->w));
++    memset(t, 0, sizeof(*t));
++}
++
++static int ensure_buffer(AVFilterContext *avctx, CUdeviceptr *buf, size_t *have, size_t need)
++{
++    CrabGeoCUDAContext *s = avctx->priv;
++    CudaFunctions *cu = s->hwctx->internal->cuda_dl;
++    if (*have >= need)
++        return 0;
++    if (*buf) {
++        /* lượt trước trên stream có thể vẫn đang đọc bộ đệm cũ */
++        CHECK_CU(cu->cuStreamSynchronize(s->cu_stream));
++        CHECK_CU(cu->cuMemFree(*buf));
++    }
++    *buf = 0;
++    *have = 0;
++    if (CHECK_CU(cu->cuMemAlloc(buf, need)) < 0)
++        return AVERROR(ENOMEM);
++    *have = need;
++    return 0;
++}
++
++static double kernel_w(int interp, double d)
++{
++    d = fabs(d);
++    if (interp == CRABGEO_INTERP_BILINEAR)
++        return d < 1.0 ? 1.0 - d : 0.0;
++    if (interp == CRABGEO_INTERP_NEAREST)
++        return d < 0.5 ? 1.0 : 0.0;
++    {
++        const double C = 0.6;   /* bicubic B=0, C=0.6 — mặc định của swscale */
++        if (d < 1.0)
++            return ((2.0 - C) * d - (3.0 - C)) * d * d + 1.0;
++        if (d < 2.0)
++            return ((-C * d + 5.0 * C) * d - 8.0 * C) * d + 4.0 * C;
++        return 0.0;
++    }
++}
++
++/* Dựng bảng một trục rồi chép lên GPU. Mẫu ra i ở toạ độ luma X = off + i*sub; nội dung chiếm
++ * [pos, pos+content) trên khung ra, ánh xạ sang nguồn SX = crop0 + (X-pos)*ratio; chỉ số mặt
++ * phẳng nguồn f = (SX - qoff)/qsub; lấy mẫu kẹp trong vùng cắt [qlo, qhi]. */
++static int build_axis(AVFilterContext *avctx, AxisTable *t, int len, double sub, double off,
++                      double pos, double content, double crop0, double crop_len, double ratio,
++                      int qlen, double qsub, double qoff)
++{
++    CrabGeoCUDAContext *s = avctx->priv;
++    CudaFunctions *cu = s->hwctx->internal->cuda_dl;
++    const double support = s->interp == CRABGEO_INTERP_BICUBIC ? 2.0 :
++                           s->interp == CRABGEO_INTERP_BILINEAR ? 1.0 : 0.5;
++    const double scale = FFMAX(1.0, ratio * sub / qsub);
++    const int taps = s->interp == CRABGEO_INTERP_NEAREST ? 1 : (int)ceil(2 * support * scale) + 1;
++    const int qlo = av_clip((int)floor(crop0 / qsub), 0, qlen - 1);
++    const int qhi = av_clip((int)ceil((crop0 + crop_len) / qsub) - 1, qlo, qlen - 1);
++    int *hidx = av_malloc_array((size_t)len * taps, sizeof(int));
++    float *hw = av_malloc_array((size_t)len * taps, sizeof(float));
++    int ret = 0;
++
++    free_axis(avctx, t);
++    if (!hidx || !hw) {
++        ret = AVERROR(ENOMEM);
++        goto end;
++    }
++    t->len = len;
++    t->taps = taps;
++    t->qmin = INT_MAX;
++    t->qmax = INT_MIN;
++    for (int i = 0; i < len; i++) {
++        int ix[64];
++        float wx[64];
++        double X = off + i * sub;
++        if (taps > 64) {
++            ret = AVERROR(ENOSYS);
++            goto end;
++        }
++        for (int k = 0; k < taps; k++) {
++            ix[k] = qlo;
++            wx[k] = 0.0f;
++        }
++        if (X < pos || X >= pos + content) {
++            ix[0] = -1;
++            goto store;
++        }
++        {
++            double f = (crop0 + (X - pos) * ratio - qoff) / qsub;
++            double sum = 0.0;
++            int n0, k = 0;
++            if (s->interp == CRABGEO_INTERP_NEAREST) {
++                ix[0] = av_clip((int)floor(f + 0.5), qlo, qhi);
++                wx[0] = 1.0f;
++            } else {
++                n0 = (int)floor(f - support * scale) + 1;
++                for (int n = n0; n < n0 + taps; n++) {
++                    double wv = kernel_w(s->interp, (n - f) / scale);
++                    ix[k] = av_clip(n, qlo, qhi);
++                    wx[k] = (float)wv;
++                    sum += wv;
++                    k++;
++                }
++                if (sum != 0.0)
++                    for (k = 0; k < taps; k++)
++                        wx[k] = (float)(wx[k] / sum);
++                else {
++                    ix[0] = av_clip((int)floor(f + 0.5), qlo, qhi);
++                    wx[0] = 1.0f;
++                }
++            }
++            for (k = 0; k < taps; k++) {
++                t->qmin = FFMIN(t->qmin, ix[k]);
++                t->qmax = FFMAX(t->qmax, ix[k]);
++            }
++        }
++store:
++        for (int k = 0; k < taps; k++) {
++            hidx[(size_t)k * len + i] = ix[k];
++            hw[(size_t)k * len + i] = wx[k];
++        }
++    }
++    if (t->qmin > t->qmax)
++        t->qmin = t->qmax = qlo;
++    if ((ret = CHECK_CU(cu->cuMemAlloc(&t->idx, (size_t)len * taps * sizeof(int)))) < 0 ||
++        (ret = CHECK_CU(cu->cuMemAlloc(&t->w, (size_t)len * taps * sizeof(float)))) < 0 ||
++        (ret = CHECK_CU(cu->cuMemcpyHtoD(t->idx, hidx, (size_t)len * taps * sizeof(int)))) < 0 ||
++        (ret = CHECK_CU(cu->cuMemcpyHtoD(t->w, hw, (size_t)len * taps * sizeof(float)))) < 0)
++        goto end;
++end:
++    av_free(hidx);
++    av_free(hw);
++    return ret;
++}
++
++static void chroma_offsets(int sub_x, int sub_y, enum AVChromaLocation loc, double *ox, double *oy)
++{
++    /* tâm mẫu màu 0 theo toạ độ liên tục luma */
++    *ox = (sub_x && (loc == AVCHROMA_LOC_CENTER || loc == AVCHROMA_LOC_TOP)) ? 1.0 : 0.5;
++    *oy = sub_y ? ((loc == AVCHROMA_LOC_TOPLEFT || loc == AVCHROMA_LOC_TOP) ? 0.5 : 1.0) : 0.5;
++}
++
++/* Chép thẳng được khi tỉ lệ 1:1 và mẫu ra i ứng ĐÚNG mẫu nguồn i - dx (số nguyên) trên lưới
++ * mặt phẳng: f = (crop0 + (off + i*sub - pos) - qoff)/qsub = i + c, cần sub == qsub và c nguyên. */
++static int copy_axis(double ratio, double sub, double off, double pos, double content, double crop0,
++                     double qsub, double qoff, int *d, int *i0, int *i1)
++{
++    double c;
++    if (ratio != 1.0 || sub != qsub)
++        return 0;
++    c = (crop0 + off - pos - qoff) / qsub;
++    if (c != floor(c))
++        return 0;
++    *d = -(int)c;
++    *i0 = (int)ceil((pos - off) / sub);
++    *i1 = (int)ceil((pos + content - off) / sub);
++    return 1;
++}
++
++static void plan_copy(CopyPlan *p, int okx, int oky, int dx, int x0, int x1, int dy, int y0, int y1, int pw, int ph)
++{
++    p->ok = okx && oky;
++    p->dx = dx;
++    p->dy = dy;
++    p->x0 = av_clip(x0, 0, pw);
++    p->x1 = av_clip(x1, 0, pw);
++    p->y0 = av_clip(y0, 0, ph);
++    p->y1 = av_clip(y1, 0, ph);
++}
++
++/* Bảng luma (không phụ thuộc vị trí mẫu màu) + bảng màu theo vị trí mẫu màu nguồn `loc`. */
++static int build_tables(AVFilterContext *avctx, enum AVChromaLocation loc)
++{
++    CrabGeoCUDAContext *s = avctx->priv;
++    const double rx = s->crop_w / s->w, ry = s->crop_h / s->h;
++    double sox, soy, dox, doy;
++    int ret;
++
++    if (!s->lx.idx) {
++        if ((ret = build_axis(avctx, &s->lx, s->ow, 1, 0.5, s->x, s->w, s->crop_x, s->crop_w, rx, s->iw, 1, 0.5)) < 0 ||
++            (ret = build_axis(avctx, &s->ly, s->oh, 1, 0.5, s->y, s->h, s->crop_y, s->crop_h, ry, s->ih, 1, 0.5)) < 0)
++            return ret;
++    }
++    {
++        int dx = 0, dy = 0, x0 = 0, x1 = 0, y0 = 0, y1 = 0;
++        int okx = copy_axis(rx, 1, 0.5, s->x, s->w, s->crop_x, 1, 0.5, &dx, &x0, &x1);
++        int oky = copy_axis(ry, 1, 0.5, s->y, s->h, s->crop_y, 1, 0.5, &dy, &y0, &y1);
++        plan_copy(&s->copy_l, okx && !s->src_rgb, oky, dx, x0, x1, dy, y0, y1, s->ow, s->oh);
++    }
++    if (s->src_rgb) {
++        s->tables_loc = loc;
++        return 0;
++    }
++    chroma_offsets(s->src_sx, s->src_sy, loc, &sox, &soy);
++    chroma_offsets(s->dst_sx, s->dst_sy, AVCHROMA_LOC_LEFT, &dox, &doy);
++    {
++        int dx = 0, dy = 0, x0 = 0, x1 = 0, y0 = 0, y1 = 0;
++        int okx = copy_axis(rx, 1 << s->dst_sx, dox, s->x, s->w, s->crop_x, 1 << s->src_sx, sox, &dx, &x0, &x1);
++        int oky = copy_axis(ry, 1 << s->dst_sy, doy, s->y, s->h, s->crop_y, 1 << s->src_sy, soy, &dy, &y0, &y1);
++        plan_copy(&s->copy_c, okx, oky, dx, x0, x1, dy, y0, y1, s->out_cw, s->out_ch);
++    }
++    if ((ret = build_axis(avctx, &s->cx, s->out_cw, 1 << s->dst_sx, dox, s->x, s->w, s->crop_x, s->crop_w, rx,
++                          AV_CEIL_RSHIFT(s->iw, s->src_sx), 1 << s->src_sx, sox)) < 0 ||
++        (ret = build_axis(avctx, &s->cy, s->out_ch, 1 << s->dst_sy, doy, s->y, s->h, s->crop_y, s->crop_h, ry,
++                          AV_CEIL_RSHIFT(s->ih, s->src_sy), 1 << s->src_sy, soy)) < 0)
++        return ret;
++    s->tables_loc = loc;
++    return 0;
++}
++
++static av_cold void crabgeo_uninit(AVFilterContext *avctx)
++{
++    CrabGeoCUDAContext *s = avctx->priv;
++    if (s->hwctx) {
++        CudaFunctions *cu = s->hwctx->internal->cuda_dl;
++        CUcontext dummy;
++        CHECK_CU(cu->cuCtxPushCurrent(s->hwctx->cuda_ctx));
++        free_axis(avctx, &s->lx);
++        free_axis(avctx, &s->ly);
++        free_axis(avctx, &s->cx);
++        free_axis(avctx, &s->cy);
++        if (s->hbuf)
++            CHECK_CU(cu->cuMemFree(s->hbuf));
++        for (int i = 0; i < 4; i++)
++            if (s->fplane[i])
++                CHECK_CU(cu->cuMemFree(s->fplane[i]));
++        if (s->cu_module)
++            CHECK_CU(cu->cuModuleUnload(s->cu_module));
++        CHECK_CU(cu->cuCtxPopCurrent(&dummy));
++    }
++    av_buffer_unref(&s->frames_ctx);
++}
++
++static int config_output(AVFilterLink *outlink)
++{
++    extern const unsigned char ff_vf_crabgeo_cuda_ptx_data[];
++    extern const unsigned int ff_vf_crabgeo_cuda_ptx_len;
++
++    AVFilterContext *avctx = outlink->src;
++    AVFilterLink *inlink = avctx->inputs[0];
++    FilterLink *inl = ff_filter_link(inlink);
++    FilterLink *outl = ff_filter_link(outlink);
++    CrabGeoCUDAContext *s = avctx->priv;
++    AVHWFramesContext *in_fc, *out_fc;
++    const AVPixFmtDescriptor *din, *dout;
++    CudaFunctions *cu;
++    CUcontext dummy;
++    double v, vals[8];
++    int ret;
++    static const char *const crop_names[] = { "iw", "ih", "in_w", "in_h", NULL };
++    static const char *const size_names[] = { "iw", "ih", "in_w", "in_h", "crop_w", "crop_h", NULL };
++    static const char *const osize_names[] = { "iw", "ih", "w", "h", NULL };
++    static const char *const pos_names[] = { "iw", "ih", "w", "h", "W", "H", NULL };
++
++    if (!inl->hw_frames_ctx) {
++        av_log(avctx, AV_LOG_ERROR, "Input must be CUDA frames\n");
++        return AVERROR(EINVAL);
++    }
++    in_fc = (AVHWFramesContext *)inl->hw_frames_ctx->data;
++    s->in_fmt = in_fc->sw_format;
++    if (!fmt_in_list(in_formats, s->in_fmt)) {
++        av_log(avctx, AV_LOG_ERROR, "Unsupported input format %s\n", av_get_pix_fmt_name(s->in_fmt));
++        return AVERROR(ENOSYS);
++    }
++    if (!fmt_in_list(out_formats, s->out_fmt)) {
++        av_log(avctx, AV_LOG_ERROR, "Unsupported output format %s\n", av_get_pix_fmt_name(s->out_fmt));
++        return AVERROR(ENOSYS);
++    }
++
++    s->iw = inlink->w;
++    s->ih = inlink->h;
++    vals[0] = vals[2] = inlink->w;
++    vals[1] = vals[3] = inlink->h;
++    if ((ret = eval_one(avctx, s->cx_expr, crop_names, vals, &s->crop_x, "crop_x")) < 0 ||
++        (ret = eval_one(avctx, s->cy_expr, crop_names, vals, &s->crop_y, "crop_y")) < 0 ||
++        (ret = eval_one(avctx, s->cw_expr, crop_names, vals, &s->crop_w, "crop_w")) < 0 ||
++        (ret = eval_one(avctx, s->ch_expr, crop_names, vals, &s->crop_h, "crop_h")) < 0)
++        return ret;
++    vals[4] = s->crop_w;
++    vals[5] = s->crop_h;
++    if ((ret = eval_one(avctx, s->w_expr, size_names, vals, &v, "w")) < 0)
++        return ret;
++    s->w = (int)lrint(v);
++    if ((ret = eval_one(avctx, s->h_expr, size_names, vals, &v, "h")) < 0)
++        return ret;
++    s->h = (int)lrint(v);
++    vals[2] = s->w;
++    vals[3] = s->h;
++    if ((ret = eval_one(avctx, s->ow_expr, osize_names, vals, &v, "ow")) < 0)
++        return ret;
++    s->ow = (int)lrint(v);
++    if ((ret = eval_one(avctx, s->oh_expr, osize_names, vals, &v, "oh")) < 0)
++        return ret;
++    s->oh = (int)lrint(v);
++    vals[4] = s->ow;
++    vals[5] = s->oh;
++    if ((ret = eval_one(avctx, s->x_expr, pos_names, vals, &s->x, "x")) < 0 ||
++        (ret = eval_one(avctx, s->y_expr, pos_names, vals, &s->y, "y")) < 0)
++        return ret;
++    if (s->w <= 0 || s->h <= 0 || s->ow <= 0 || s->oh <= 0 || s->crop_w <= 0 || s->crop_h <= 0) {
++        av_log(avctx, AV_LOG_ERROR, "Invalid size: content %dx%d, output %dx%d, crop %gx%g\n",
++               s->w, s->h, s->ow, s->oh, s->crop_w, s->crop_h);
++        return AVERROR(EINVAL);
++    }
++
++    din = av_pix_fmt_desc_get(s->in_fmt);
++    dout = av_pix_fmt_desc_get(s->out_fmt);
++    s->src_rgb = !!(din->flags & AV_PIX_FMT_FLAG_RGB);
++    s->src_alpha = !!(din->flags & AV_PIX_FMT_FLAG_ALPHA);
++    s->dst_alpha = !!(dout->flags & AV_PIX_FMT_FLAG_ALPHA);
++    s->src_sx = s->src_rgb ? 0 : din->log2_chroma_w;
++    s->src_sy = s->src_rgb ? 0 : din->log2_chroma_h;
++    s->dst_sx = dout->log2_chroma_w;
++    s->dst_sy = dout->log2_chroma_h;
++    s->out_cw = AV_CEIL_RSHIFT(s->ow, s->dst_sx);
++    s->out_ch = AV_CEIL_RSHIFT(s->oh, s->dst_sy);
++    s->passthrough_geom = s->passthrough && s->in_fmt == s->out_fmt &&
++                          s->ow == inlink->w && s->oh == inlink->h && s->w == inlink->w &&
++                          s->h == inlink->h && s->x == 0 && s->y == 0 && s->crop_x == 0 &&
++                          s->crop_y == 0 && s->crop_w == inlink->w && s->crop_h == inlink->h;
++
++    s->hwctx = ((AVHWDeviceContext *)in_fc->device_ref->data)->hwctx;
++    s->cu_stream = s->hwctx->stream;
++    cu = s->hwctx->internal->cuda_dl;
++
++    av_buffer_unref(&s->frames_ctx);
++    s->frames_ctx = av_hwframe_ctx_alloc(in_fc->device_ref);
++    if (!s->frames_ctx)
++        return AVERROR(ENOMEM);
++    out_fc = (AVHWFramesContext *)s->frames_ctx->data;
++    out_fc->format    = AV_PIX_FMT_CUDA;
++    out_fc->sw_format = s->out_fmt;
++    out_fc->width     = FFALIGN(s->ow, 2);
++    out_fc->height    = FFALIGN(s->oh, 2);
++    ret = av_hwframe_ctx_init(s->frames_ctx);
++    if (ret < 0)
++        return ret;
++    av_buffer_unref(&outl->hw_frames_ctx);
++    outl->hw_frames_ctx = av_buffer_ref(s->frames_ctx);
++    if (!outl->hw_frames_ctx)
++        return AVERROR(ENOMEM);
++    outlink->w = s->ow;
++    outlink->h = s->oh;
++    outlink->sample_aspect_ratio = inlink->sample_aspect_ratio;
++
++    ret = CHECK_CU(cu->cuCtxPushCurrent(s->hwctx->cuda_ctx));
++    if (ret < 0)
++        return ret;
++    if (!s->cu_module)
++        ret = ff_cuda_load_module(avctx, s->hwctx, &s->cu_module,
++                                  ff_vf_crabgeo_cuda_ptx_data, ff_vf_crabgeo_cuda_ptx_len);
++    for (int i = 0; ret >= 0 && i < FN_NB; i++)
++        ret = CHECK_CU(cu->cuModuleGetFunction(&s->fn[i], s->cu_module, fn_names[i]));
++    free_axis(avctx, &s->lx);
++    free_axis(avctx, &s->ly);
++    s->tables_loc = -1;
++    CHECK_CU(cu->cuCtxPopCurrent(&dummy));
++    if (ret < 0)
++        return ret;
++
++    av_log(avctx, AV_LOG_VERBOSE, "%s %dx%d crop %g,%g %gx%g -> %dx%d at %g,%g in %dx%d %s\n",
++           av_get_pix_fmt_name(s->in_fmt), inlink->w, inlink->h, s->crop_x, s->crop_y,
++           s->crop_w, s->crop_h, s->w, s->h, s->x, s->y, s->ow, s->oh, av_get_pix_fmt_name(s->out_fmt));
++    return 0;
++}
++
++static void mat_coeffs(int mat, double *kr, double *kb)
++{
++    switch (mat) {
++    case MAT_BT709:  *kr = 0.2126; *kb = 0.0722; break;
++    case MAT_BT2020: *kr = 0.2627; *kb = 0.0593; break;
++    default:         *kr = 0.299;  *kb = 0.114;  break;
++    }
++}
++
++static int frame_matrix(const AVFrame *f, int forced)
++{
++    if (forced != MAT_AUTO)
++        return forced;
++    switch (f->colorspace) {
++    case AVCOL_SPC_BT709:      return MAT_BT709;
++    case AVCOL_SPC_BT2020_NCL:
++    case AVCOL_SPC_BT2020_CL:  return MAT_BT2020;
++    default:                   return MAT_BT601;   /* như swscale khi thiếu nhãn */
++    }
++}
++
++static int frame_range(const AVFrame *f, int forced)
++{
++    if (forced != RNG_AUTO)
++        return forced;
++    return f->color_range == AVCOL_RANGE_JPEG ? RNG_PC : RNG_TV;
++}
++
++/* (Y,U,V)|(R,G,B) nguồn -> (Y,U,V) ra, thang 8-bit. */
++static void build_matrix(CrabGeoMat *out, int src_rgb, int in_mat, int in_rng, int out_mat, int out_rng)
++{
++    double a[3][4], b[3][4], kr, kb, kg;
++    if (src_rgb) {
++        memset(a, 0, sizeof(a));
++        a[0][0] = a[1][1] = a[2][2] = 1.0 / 255.0;
++    } else {
++        const double ys = in_rng == RNG_TV ? 1.0 / 219.0 : 1.0 / 255.0;
++        const double yo = in_rng == RNG_TV ? -16.0 : 0.0;
++        const double cs = in_rng == RNG_TV ? 1.0 / 224.0 : 1.0 / 255.0;
++        double rcr, bcb, gcb, gcr;
++        mat_coeffs(in_mat, &kr, &kb);
++        kg = 1.0 - kr - kb;
++        rcr = 2 * (1 - kr);
++        bcb = 2 * (1 - kb);
++        gcb = -kb * bcb / kg;
++        gcr = -kr * rcr / kg;
++        a[0][0] = ys; a[0][1] = 0;        a[0][2] = rcr * cs; a[0][3] = ys * yo - rcr * cs * 128;
++        a[1][0] = ys; a[1][1] = gcb * cs; a[1][2] = gcr * cs; a[1][3] = ys * yo - (gcb + gcr) * cs * 128;
++        a[2][0] = ys; a[2][1] = bcb * cs; a[2][2] = 0;        a[2][3] = ys * yo - bcb * cs * 128;
++    }
++    mat_coeffs(out_mat, &kr, &kb);
++    kg = 1.0 - kr - kb;
++    {
++        const double ys = out_rng == RNG_TV ? 219.0 : 255.0, yo = out_rng == RNG_TV ? 16.0 : 0.0;
++        const double cs = out_rng == RNG_TV ? 224.0 : 255.0;
++        const double ub = 1.0 / (2 * (1 - kb)), vr = 1.0 / (2 * (1 - kr));
++        b[0][0] = ys * kr;            b[0][1] = ys * kg;       b[0][2] = ys * kb;            b[0][3] = yo;
++        b[1][0] = cs * ub * -kr;      b[1][1] = cs * ub * -kg; b[1][2] = cs * ub * (1 - kb); b[1][3] = 128;
++        b[2][0] = cs * vr * (1 - kr); b[2][1] = cs * vr * -kg; b[2][2] = cs * vr * -kb;      b[2][3] = 128;
++    }
++    for (int i = 0; i < 3; i++)
++        for (int j = 0; j < 4; j++) {
++            double acc = j == 3 ? b[i][3] : 0.0;
++            for (int k = 0; k < 3; k++)
++                acc += b[i][k] * a[k][j];
++            out->m[4 * i + j] = (float)acc;
++        }
++}
++
++static CrabGeoIO io_of(const AVFrame *f, int plane, int step, int offset, int bytes, int p010)
++{
++    CrabGeoIO io = {
++        .linesize = f->linesize[plane], .step = step, .offset = offset, .bytes = bytes,
++        .norm = bytes == 2 ? 1.0f / 256.0f : 1.0f, .maxval = bytes == 2 ? 65535.0f : 255.0f,
++        .mask = p010 ? 0xFFC0 : 0xFFFF,
++    };
++    return io;
++}
++
++/* Mặt phẳng/thành phần c (0=Y|R, 1=U|G, 2=V|B, 3=A) của khung theo định dạng: con trỏ + IO. */
++static int component(const AVFrame *f, enum AVPixelFormat fmt, int c, CUdeviceptr *ptr, CrabGeoIO *io)
++{
++    switch (fmt) {
++    case AV_PIX_FMT_YUV420P: case AV_PIX_FMT_YUV444P: case AV_PIX_FMT_YUVA420P:
++        *ptr = (CUdeviceptr)f->data[c];
++        *io = io_of(f, c, 1, 0, 1, 0);
++        return f->data[c] ? 0 : AVERROR(EINVAL);
++    case AV_PIX_FMT_YUV444P16:
++        *ptr = (CUdeviceptr)f->data[c];
++        *io = io_of(f, c, 1, 0, 2, 0);
++        return c < 3 ? 0 : AVERROR(EINVAL);
++    case AV_PIX_FMT_NV12: case AV_PIX_FMT_P010: case AV_PIX_FMT_P016: {
++        int b = fmt == AV_PIX_FMT_NV12 ? 1 : 2, p010 = fmt == AV_PIX_FMT_P010;
++        if (c == 0) {
++            *ptr = (CUdeviceptr)f->data[0];
++            *io = io_of(f, 0, 1, 0, b, p010);
++        } else if (c < 3) {
++            *ptr = (CUdeviceptr)f->data[1];
++            *io = io_of(f, 1, 2, c - 1, b, p010);
++        } else
++            return AVERROR(EINVAL);
++        return 0;
++    }
++    case AV_PIX_FMT_RGBA: case AV_PIX_FMT_BGRA: case AV_PIX_FMT_RGB0: case AV_PIX_FMT_BGR0: {
++        int rgb_first = fmt == AV_PIX_FMT_RGBA || fmt == AV_PIX_FMT_RGB0;
++        static const int off_rgba[4] = { 0, 1, 2, 3 }, off_bgra[4] = { 2, 1, 0, 3 };
++        *ptr = (CUdeviceptr)f->data[0];
++        *io = io_of(f, 0, 4, rgb_first ? off_rgba[c] : off_bgra[c], 1, 0);
++        return 0;
++    }
++    default:
++        return AVERROR(ENOSYS);
++    }
++}
++
++static int launch(AVFilterContext *avctx, int fn, int w, int h, void **args)
++{
++    CrabGeoCUDAContext *s = avctx->priv;
++    CudaFunctions *cu = s->hwctx->internal->cuda_dl;
++    if (w <= 0 || h <= 0)
++        return 0;
++    return CHECK_CU(cu->cuLaunchKernel(s->fn[fn], DIV_UP(w, BLOCK_X), DIV_UP(h, BLOCK_Y), 1,
++                                       BLOCK_X, BLOCK_Y, 1, 0, s->cu_stream, args, NULL));
++}
++
++/* Lượt ngang (thành phần c của nguồn, bảng tx, các hàng ty.qmin..qmax) vào hbuf. */
++static int hpass(AVFilterContext *avctx, const AVFrame *in, int c, AxisTable *tx, AxisTable *ty)
++{
++    CrabGeoCUDAContext *s = avctx->priv;
++    CUdeviceptr src;
++    CrabGeoIO io;
++    int r0 = ty->qmin, rows = ty->qmax - ty->qmin + 1, pw = tx->len, ret;
++    if ((ret = component(in, s->in_fmt, c, &src, &io)) < 0)
++        return ret;
++    if ((ret = ensure_buffer(avctx, &s->hbuf, &s->hbuf_size, (size_t)pw * rows * sizeof(float))) < 0)
++        return ret;
++    {
++        void *args[] = { &src, &io, &r0, &rows, &tx->idx, &tx->w, &tx->taps, &s->hbuf, &pw };
++        return launch(avctx, io.bytes == 2 ? FN_HPASS16 : FN_HPASS8, pw, rows, args);
++    }
++}
++
++/* Lượt dọc từ hbuf: ra mã trên khung ra (dst != NULL) hoặc ra mặt phẳng float `fp`. */
++static int vpass(AVFilterContext *avctx, AxisTable *tx, AxisTable *ty, AVFrame *out, int c,
++                 CUdeviceptr fp, float bg)
++{
++    CrabGeoCUDAContext *s = avctx->priv;
++    int pw = tx->len, ph = ty->len, r0 = ty->qmin, ret;
++    if (!fp) {
++        CUdeviceptr dst;
++        CrabGeoIO io;
++        if ((ret = component(out, s->out_fmt, c, &dst, &io)) < 0)
++            return ret;
++        {
++            void *args[] = { &s->hbuf, &pw, &ph, &r0, &ty->idx, &ty->w, &ty->taps, &tx->idx, &dst, &io, &bg };
++            return launch(avctx, io.bytes == 2 ? FN_VOUT16 : FN_VOUT8, pw, ph, args);
++        }
++    } else {
++        void *args[] = { &s->hbuf, &pw, &ph, &r0, &ty->idx, &ty->w, &ty->taps, &tx->idx, &fp, &bg };
++        return launch(avctx, FN_VF, pw, ph, args);
++    }
++}
++
++static int copy_component(AVFilterContext *avctx, const AVFrame *in, AVFrame *out, int c,
++                          const CopyPlan *cp, int pw, int ph, float bg)
++{
++    CrabGeoCUDAContext *s = avctx->priv;
++    CUdeviceptr src, dst;
++    CrabGeoIO sio, dio;
++    int dx = cp->dx, dy = cp->dy, x0 = cp->x0, x1 = cp->x1, y0 = cp->y0, y1 = cp->y1, ret, fn;
++    if ((ret = component(in, s->in_fmt, c, &src, &sio)) < 0 ||
++        (ret = component(out, s->out_fmt, c, &dst, &dio)) < 0)
++        return ret;
++    fn = sio.bytes == 2 ? (dio.bytes == 2 ? FN_COPY22 : FN_COPY21) : (dio.bytes == 2 ? FN_COPY12 : FN_COPY11);
++    {
++        void *args[] = { &src, &sio, &dst, &dio, &pw, &ph, &dx, &dy, &x0, &x1, &y0, &y1, &bg };
++        return launch(avctx, fn, pw, ph, args);
++    }
++}
++
++static int resample_to_float(AVFilterContext *avctx, const AVFrame *in, int c, AxisTable *tx,
++                             AxisTable *ty, int slot)
++{
++    CrabGeoCUDAContext *s = avctx->priv;
++    int ret = ensure_buffer(avctx, &s->fplane[slot], &s->fplane_size[slot],
++                            (size_t)tx->len * ty->len * sizeof(float));
++    if (ret < 0 || (ret = hpass(avctx, in, c, tx, ty)) < 0)
++        return ret;
++    return vpass(avctx, tx, ty, NULL, 0, s->fplane[slot], 0.0f);
++}
++
++static int process(AVFilterContext *avctx, const AVFrame *in, AVFrame *out, int identity, CrabGeoMat *m)
++{
++    CrabGeoCUDAContext *s = avctx->priv;
++    const float bgy = s->out_range == RNG_TV ? 16.0f : 0.0f;
++    const float bga = s->bg == BG_TRANSPARENT ? 0.0f : 255.0f;
++    CUdeviceptr dy, du, dv, da = 0;
++    CrabGeoIO ioy, iou, iov, ioa = { 0 };
++    int ret;
++
++    if ((ret = component(out, s->out_fmt, 0, &dy, &ioy)) < 0 ||
++        (ret = component(out, s->out_fmt, 1, &du, &iou)) < 0 ||
++        (ret = component(out, s->out_fmt, 2, &dv, &iov)) < 0)
++        return ret;
++    if (s->dst_alpha && (ret = component(out, s->out_fmt, 3, &da, &ioa)) < 0)
++        return ret;
++
++    if (s->src_rgb) {
++        int w = s->ow, h = s->oh, cw = s->out_cw, ch = s->out_ch;
++        int csx = 1 << s->dst_sx, csy = 1 << s->dst_sy, wa = s->alpha_chroma && s->src_alpha;
++        CUdeviceptr A;
++        for (int c = 0; c < 3 + s->src_alpha; c++)
++            if ((ret = resample_to_float(avctx, in, c, &s->lx, &s->ly, c)) < 0)
++                return ret;
++        A = s->src_alpha ? s->fplane[3] : 0;
++        {
++            void *args[] = { &s->fplane[0], &s->fplane[1], &s->fplane[2], &A, &w, &h,
++                             &s->lx.idx, &s->ly.idx, m,
++                             &dy, &ioy, &da, &ioa, (void *)&bgy, (void *)&bga };
++            if ((ret = launch(avctx, FN_RGBL, w, h, args)) < 0)
++                return ret;
++        }
++        {
++            void *args[] = { &s->fplane[0], &s->fplane[1], &s->fplane[2], &A, &w, &h, &cw, &ch,
++                             &csx, &csy, &wa, &s->lx.idx, &s->ly.idx, m,
++                             &du, &iou, &dv, &iov };
++            return launch(avctx, FN_RGBC, cw, ch, args);
++        }
++    }
++
++    if (identity) {
++        for (int c = 0; c < 3; c++) {
++            const CopyPlan *cp = c ? &s->copy_c : &s->copy_l;
++            AxisTable *tx = c ? &s->cx : &s->lx, *ty = c ? &s->cy : &s->ly;
++            float bg = c ? 128.0f : bgy;
++            if (cp->ok) {
++                if ((ret = copy_component(avctx, in, out, c, cp, tx->len, ty->len, bg)) < 0)
++                    return ret;
++            } else if ((ret = hpass(avctx, in, c, tx, ty)) < 0 ||
++                       (ret = vpass(avctx, tx, ty, out, c, 0, bg)) < 0)
++                return ret;
++        }
++    } else {
++        int w = s->ow, h = s->oh, cw = s->out_cw, ch = s->out_ch;
++        int csxi = 1 << s->dst_sx, csyi = 1 << s->dst_sy;
++        float csx = csxi, csy = csyi;
++        double dox, doy;
++        float cox, coy;
++        chroma_offsets(s->dst_sx, s->dst_sy, AVCHROMA_LOC_LEFT, &dox, &doy);
++        cox = dox;
++        coy = doy;
++        if ((ret = resample_to_float(avctx, in, 0, &s->lx, &s->ly, 0)) < 0 ||
++            (ret = resample_to_float(avctx, in, 1, &s->cx, &s->cy, 1)) < 0 ||
++            (ret = resample_to_float(avctx, in, 2, &s->cx, &s->cy, 2)) < 0)
++            return ret;
++        {
++            void *args[] = { &s->fplane[0], &s->fplane[1], &s->fplane[2], &w, &h, &cw, &ch,
++                             &csx, &csy, &cox, &coy, &s->lx.idx, &s->ly.idx,
++                             m, &dy, &ioy, (void *)&bgy };
++            if ((ret = launch(avctx, FN_YUVL, w, h, args)) < 0)
++                return ret;
++        }
++        {
++            void *args[] = { &s->fplane[0], &s->fplane[1], &s->fplane[2], &w, &h, &cw, &ch,
++                             &csxi, &csyi, &s->cx.idx, &s->cy.idx,
++                             m, &du, &iou, &dv, &iov };
++            if ((ret = launch(avctx, FN_YUVC, cw, ch, args)) < 0)
++                return ret;
++        }
++    }
++    if (s->dst_alpha) {
++        if (s->src_alpha) {
++            if (s->copy_l.ok) {
++                if ((ret = copy_component(avctx, in, out, 3, &s->copy_l, s->lx.len, s->ly.len, bga)) < 0)
++                    return ret;
++            } else if ((ret = hpass(avctx, in, 3, &s->lx, &s->ly)) < 0 ||
++                       (ret = vpass(avctx, &s->lx, &s->ly, out, 3, 0, bga)) < 0)
++                return ret;
++        } else {
++            int w = s->ow, h = s->oh;
++            void *args[] = { &w, &h, &s->lx.idx, &s->ly.idx, &da, &ioa, (void *)&bga };
++            if ((ret = launch(avctx, FN_FILLA, w, h, args)) < 0)
++                return ret;
++        }
++    }
++    return 0;
++}
++
++static int filter_frame(AVFilterLink *inlink, AVFrame *in)
++{
++    AVFilterContext *avctx = inlink->dst;
++    AVFilterLink *outlink = avctx->outputs[0];
++    CrabGeoCUDAContext *s = avctx->priv;
++    CudaFunctions *cu = s->hwctx->internal->cuda_dl;
++    AVFrame *out = NULL;
++    CUcontext dummy;
++    CrabGeoMat m;
++    int in_mat, in_rng, identity, ret;
++
++    in_mat = frame_matrix(in, s->in_matrix);
++    in_rng = frame_range(in, s->in_range);
++    identity = !s->src_rgb && in_mat == s->out_matrix && in_rng == s->out_range;
++    if (s->passthrough_geom && identity)
++        return ff_filter_frame(outlink, in);
++
++    out = av_frame_alloc();
++    if (!out) {
++        ret = AVERROR(ENOMEM);
++        goto fail;
++    }
++    ret = av_hwframe_get_buffer(s->frames_ctx, out, 0);
++    if (ret < 0)
++        goto fail;
++    ret = av_frame_copy_props(out, in);
++    if (ret < 0)
++        goto fail;
++    out->width  = s->ow;
++    out->height = s->oh;
++    out->crop_top = out->crop_bottom = out->crop_left = out->crop_right = 0;
++    build_matrix(&m, s->src_rgb, in_mat, in_rng, s->out_matrix, s->out_range);
++
++    ret = CHECK_CU(cu->cuCtxPushCurrent(s->hwctx->cuda_ctx));
++    if (ret < 0)
++        goto fail;
++    if (s->tables_loc != (int)in->chroma_location || !s->lx.idx)
++        ret = build_tables(avctx, in->chroma_location);
++    if (ret >= 0)
++        ret = process(avctx, in, out, identity, &m);
++    CHECK_CU(cu->cuCtxPopCurrent(&dummy));
++    if (ret < 0)
++        goto fail;
++
++    out->colorspace = s->out_matrix == MAT_BT709 ? AVCOL_SPC_BT709 :
++                      s->out_matrix == MAT_BT2020 ? AVCOL_SPC_BT2020_NCL : AVCOL_SPC_BT470BG;
++    out->color_range = s->out_range == RNG_TV ? AVCOL_RANGE_MPEG : AVCOL_RANGE_JPEG;
++    out->chroma_location = AVCHROMA_LOC_LEFT;
++    av_frame_free(&in);
++    return ff_filter_frame(outlink, out);
++fail:
++    av_frame_free(&in);
++    av_frame_free(&out);
++    return ret;
++}
++
++/* Ngõ vào nhận MỌI ma trận/dải (bộ lọc tự đổi), ngõ ra đúng ma trận/dải đã cấu hình. */
++static int crabgeo_query_formats(const AVFilterContext *avctx, AVFilterFormatsConfig **cfg_in,
++                                 AVFilterFormatsConfig **cfg_out)
++{
++    const CrabGeoCUDAContext *s = avctx->priv;
++    static const enum AVPixelFormat pix[] = { AV_PIX_FMT_CUDA, AV_PIX_FMT_NONE };
++    const int csp = s->out_matrix == MAT_BT709 ? AVCOL_SPC_BT709 :
++                    s->out_matrix == MAT_BT2020 ? AVCOL_SPC_BT2020_NCL : AVCOL_SPC_BT470BG;
++    const int rng = s->out_range == RNG_TV ? AVCOL_RANGE_MPEG : AVCOL_RANGE_JPEG;
++    int ret;
++    if ((ret = ff_formats_ref(ff_make_format_list(pix), &cfg_in[0]->formats)) < 0 ||
++        (ret = ff_formats_ref(ff_make_format_list(pix), &cfg_out[0]->formats)) < 0 ||
++        (ret = ff_formats_ref(ff_all_color_spaces(), &cfg_in[0]->color_spaces)) < 0 ||
++        (ret = ff_formats_ref(ff_all_color_ranges(), &cfg_in[0]->color_ranges)) < 0 ||
++        (ret = ff_formats_ref(ff_make_formats_list_singleton(csp), &cfg_out[0]->color_spaces)) < 0 ||
++        (ret = ff_formats_ref(ff_make_formats_list_singleton(rng), &cfg_out[0]->color_ranges)) < 0)
++        return ret;
++    return 0;
++}
++
++#define OFFSET(x) offsetof(CrabGeoCUDAContext, x)
++#define FLAGS (AV_OPT_FLAG_FILTERING_PARAM | AV_OPT_FLAG_VIDEO_PARAM)
++
++static const AVOption crabgeo_cuda_options[] = {
++    { "w",      "content width",  OFFSET(w_expr),  AV_OPT_TYPE_STRING, { .str = "crop_w" }, 0, 0, FLAGS },
++    { "h",      "content height", OFFSET(h_expr),  AV_OPT_TYPE_STRING, { .str = "crop_h" }, 0, 0, FLAGS },
++    { "ow",     "output width",   OFFSET(ow_expr), AV_OPT_TYPE_STRING, { .str = "w" }, 0, 0, FLAGS },
++    { "oh",     "output height",  OFFSET(oh_expr), AV_OPT_TYPE_STRING, { .str = "h" }, 0, 0, FLAGS },
++    { "x",      "content x on output", OFFSET(x_expr), AV_OPT_TYPE_STRING, { .str = "0" }, 0, 0, FLAGS },
++    { "y",      "content y on output", OFFSET(y_expr), AV_OPT_TYPE_STRING, { .str = "0" }, 0, 0, FLAGS },
++    { "crop_x", "source crop x", OFFSET(cx_expr), AV_OPT_TYPE_STRING, { .str = "0" }, 0, 0, FLAGS },
++    { "crop_y", "source crop y", OFFSET(cy_expr), AV_OPT_TYPE_STRING, { .str = "0" }, 0, 0, FLAGS },
++    { "crop_w", "source crop w", OFFSET(cw_expr), AV_OPT_TYPE_STRING, { .str = "iw" }, 0, 0, FLAGS },
++    { "crop_h", "source crop h", OFFSET(ch_expr), AV_OPT_TYPE_STRING, { .str = "ih" }, 0, 0, FLAGS },
++    { "format", "output pixel format", OFFSET(out_fmt), AV_OPT_TYPE_PIXEL_FMT, { .i64 = AV_PIX_FMT_YUV420P }, AV_PIX_FMT_NONE, INT_MAX, FLAGS },
++    { "bg", "background", OFFSET(bg), AV_OPT_TYPE_INT, { .i64 = BG_BLACK }, 0, 1, FLAGS, .unit = "bg" },
++        { "black",       NULL, 0, AV_OPT_TYPE_CONST, { .i64 = BG_BLACK },       0, 0, FLAGS, .unit = "bg" },
++        { "transparent", NULL, 0, AV_OPT_TYPE_CONST, { .i64 = BG_TRANSPARENT }, 0, 0, FLAGS, .unit = "bg" },
++    { "interp", "interpolation", OFFSET(interp), AV_OPT_TYPE_INT, { .i64 = CRABGEO_INTERP_BICUBIC }, 0, 2, FLAGS, .unit = "interp" },
++        { "bicubic",  NULL, 0, AV_OPT_TYPE_CONST, { .i64 = CRABGEO_INTERP_BICUBIC },  0, 0, FLAGS, .unit = "interp" },
++        { "bilinear", NULL, 0, AV_OPT_TYPE_CONST, { .i64 = CRABGEO_INTERP_BILINEAR }, 0, 0, FLAGS, .unit = "interp" },
++        { "nearest",  NULL, 0, AV_OPT_TYPE_CONST, { .i64 = CRABGEO_INTERP_NEAREST },  0, 0, FLAGS, .unit = "interp" },
++    { "out_matrix", "output matrix", OFFSET(out_matrix), AV_OPT_TYPE_INT, { .i64 = MAT_BT709 }, 0, 2, FLAGS, .unit = "omat" },
++        { "bt601",  NULL, 0, AV_OPT_TYPE_CONST, { .i64 = MAT_BT601 },  0, 0, FLAGS, .unit = "omat" },
++        { "bt709",  NULL, 0, AV_OPT_TYPE_CONST, { .i64 = MAT_BT709 },  0, 0, FLAGS, .unit = "omat" },
++        { "bt2020", NULL, 0, AV_OPT_TYPE_CONST, { .i64 = MAT_BT2020 }, 0, 0, FLAGS, .unit = "omat" },
++    { "out_range", "output range", OFFSET(out_range), AV_OPT_TYPE_INT, { .i64 = RNG_TV }, 0, 1, FLAGS, .unit = "orng" },
++        { "tv", NULL, 0, AV_OPT_TYPE_CONST, { .i64 = RNG_TV }, 0, 0, FLAGS, .unit = "orng" },
++        { "pc", NULL, 0, AV_OPT_TYPE_CONST, { .i64 = RNG_PC }, 0, 0, FLAGS, .unit = "orng" },
++    { "in_matrix", "force input matrix", OFFSET(in_matrix), AV_OPT_TYPE_INT, { .i64 = MAT_AUTO }, -1, 2, FLAGS, .unit = "imat" },
++        { "auto",   NULL, 0, AV_OPT_TYPE_CONST, { .i64 = MAT_AUTO },   0, 0, FLAGS, .unit = "imat" },
++        { "bt601",  NULL, 0, AV_OPT_TYPE_CONST, { .i64 = MAT_BT601 },  0, 0, FLAGS, .unit = "imat" },
++        { "bt709",  NULL, 0, AV_OPT_TYPE_CONST, { .i64 = MAT_BT709 },  0, 0, FLAGS, .unit = "imat" },
++        { "bt2020", NULL, 0, AV_OPT_TYPE_CONST, { .i64 = MAT_BT2020 }, 0, 0, FLAGS, .unit = "imat" },
++    { "in_range", "force input range", OFFSET(in_range), AV_OPT_TYPE_INT, { .i64 = RNG_AUTO }, -1, 1, FLAGS, .unit = "irng" },
++        { "auto", NULL, 0, AV_OPT_TYPE_CONST, { .i64 = RNG_AUTO }, 0, 0, FLAGS, .unit = "irng" },
++        { "tv",   NULL, 0, AV_OPT_TYPE_CONST, { .i64 = RNG_TV },   0, 0, FLAGS, .unit = "irng" },
++        { "pc",   NULL, 0, AV_OPT_TYPE_CONST, { .i64 = RNG_PC },   0, 0, FLAGS, .unit = "irng" },
++    { "alpha_chroma", "alpha-weighted 4:2:0 chroma", OFFSET(alpha_chroma), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, FLAGS },
++    { "passthrough", "pass frames through when nothing changes", OFFSET(passthrough), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, FLAGS },
++    { NULL },
++};
++
++AVFILTER_DEFINE_CLASS(crabgeo_cuda);
++
++static const AVFilterPad crabgeo_cuda_inputs[] = {
++    { .name = "default", .type = AVMEDIA_TYPE_VIDEO, .filter_frame = filter_frame },
++};
++
++static const AVFilterPad crabgeo_cuda_outputs[] = {
++    { .name = "default", .type = AVMEDIA_TYPE_VIDEO, .config_props = config_output },
++};
++
++const FFFilter ff_vf_crabgeo_cuda = {
++    .p.name         = "crabgeo_cuda",
++    .p.description  = NULL_IF_CONFIG_SMALL("CrabbyCut: crop, scale, colour-convert and place video using CUDA"),
++    .p.priv_class   = &crabgeo_cuda_class,
++    .priv_size      = sizeof(CrabGeoCUDAContext),
++    .uninit         = crabgeo_uninit,
++    FILTER_INPUTS(crabgeo_cuda_inputs),
++    FILTER_OUTPUTS(crabgeo_cuda_outputs),
++    FILTER_QUERY_FUNC2(crabgeo_query_formats),
++    .flags_internal = FF_FILTER_FLAG_HWFRAME_AWARE,
++};
+diff --git a/libavfilter/vf_crabgeo_cuda.cu b/libavfilter/vf_crabgeo_cuda.cu
+new file mode 100644
+index 0000000..1757b9a
+--- /dev/null
++++ b/libavfilter/vf_crabgeo_cuda.cu
+@@ -0,0 +1,310 @@
++/*
++ * CrabbyCut: hình học + đổi màu trên CUDA — lọc TÁCH ĐƯỢC hai lượt như swscale:
++ *   HPass: mặt phẳng nguồn -> bộ đệm float (cột = cột của mặt phẳng ra, hàng = hàng nguồn cần dùng)
++ *   VPass: bộ đệm -> mặt phẳng ra (ghi thẳng mã, hoặc ghi float cho lượt đổi màu)
++ *   Conv*: đổi ma trận/dải màu (nguồn YUV khác ma trận, hoặc nguồn RGB(A))
++ *   Copy:  tỉ lệ 1:1, toạ độ nguyên, không đổi màu -> chép thẳng (kèm đổi định dạng/độ sâu bit).
++ * Bảng chỉ số/trọng số xếp THEO TAP (idx[t*len + i]) để các luồng liền nhau đọc ô liền nhau;
++ * idx[i] < 0 (tap 0) = mẫu ra nằm ngoài nội dung.
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#include "vf_crabgeo_cuda.h"
++
++template <int B>
++__device__ static inline float rdt(const unsigned char *__restrict__ base, const CrabGeoIO &io, int x, int y)
++{
++    const unsigned char *row = base + y * io.linesize;
++    if (B == 2)
++        return ((const unsigned short *)row)[x * io.step + io.offset] * (1.0f / 256.0f);
++    return row[x * io.step + io.offset];
++}
++
++template <int B>
++__device__ static inline void wrt(unsigned char *__restrict__ base, const CrabGeoIO &io, int x, int y, float v)
++{
++    unsigned char *row = base + y * io.linesize;
++    if (B == 2) {
++        float q = v * 256.0f + (io.mask != 0xFFFF ? 32.0f : 0.5f);
++        q = q < 0.0f ? 0.0f : (q > 65535.0f ? 65535.0f : q);
++        ((unsigned short *)row)[x * io.step + io.offset] = (unsigned short)((int)q & io.mask);
++    } else {
++        float q = v + 0.5f;
++        q = q < 0.0f ? 0.0f : (q > 255.0f ? 255.0f : q);
++        row[x * io.step + io.offset] = (unsigned char)(int)q;
++    }
++}
++
++__device__ static inline float rd(const unsigned char *__restrict__ base, const CrabGeoIO &io, int x, int y)
++{
++    return io.bytes == 2 ? rdt<2>(base, io, x, y) : rdt<1>(base, io, x, y);
++}
++
++__device__ static inline void wr(unsigned char *__restrict__ base, const CrabGeoIO &io, int x, int y, float v)
++{
++    if (io.bytes == 2)
++        wrt<2>(base, io, x, y, v);
++    else
++        wrt<1>(base, io, x, y, v);
++}
++
++template <int B>
++__device__ static void hpass(const unsigned char *__restrict__ src, const CrabGeoIO &io, int r0, int rows,
++                             const int *__restrict__ idx, const float *__restrict__ w, int taps,
++                             float *__restrict__ hbuf, int pw)
++{
++    int i = blockIdx.x * blockDim.x + threadIdx.x;
++    int r = blockIdx.y * blockDim.y + threadIdx.y;
++    if (i >= pw || r >= rows)
++        return;
++    float acc = 0.0f;
++    if (idx[i] >= 0) {
++        for (int t = 0; t < taps; t++)
++            acc += w[t * pw + i] * rdt<B>(src, io, idx[t * pw + i], r0 + r);
++    }
++    hbuf[r * pw + i] = acc;
++}
++
++template <int B>
++__device__ static void vpass_out(const float *__restrict__ hbuf, int pw, int ph, int r0,
++                                 const int *__restrict__ idx, const float *__restrict__ w, int taps,
++                                 const int *__restrict__ hidx, unsigned char *__restrict__ dst,
++                                 const CrabGeoIO &io, float bg)
++{
++    int i = blockIdx.x * blockDim.x + threadIdx.x;
++    int j = blockIdx.y * blockDim.y + threadIdx.y;
++    if (i >= pw || j >= ph)
++        return;
++    float v = bg;
++    if (idx[j] >= 0 && hidx[i] >= 0) {
++        v = 0.0f;
++        for (int t = 0; t < taps; t++)
++            v += w[t * ph + j] * hbuf[(idx[t * ph + j] - r0) * pw + i];
++    }
++    wrt<B>(dst, io, i, j, v);
++}
++
++/* Chép thẳng: mẫu ra (i, j) <- nguồn (i - dx, j - dy) nếu nằm trong [x0,x1)x[y0,y1), không thì bg. */
++template <int SB, int DB>
++__device__ static void copy_plane(const unsigned char *__restrict__ src, const CrabGeoIO &sio,
++                                  unsigned char *__restrict__ dst, const CrabGeoIO &dio,
++                                  int pw, int ph, int dx, int dy, int x0, int x1, int y0, int y1, float bg)
++{
++    int i = blockIdx.x * blockDim.x + threadIdx.x;
++    int j = blockIdx.y * blockDim.y + threadIdx.y;
++    if (i >= pw || j >= ph)
++        return;
++    float v = bg;
++    if (i >= x0 && i < x1 && j >= y0 && j < y1)
++        v = rdt<SB>(src, sio, i - dx, j - dy);
++    wrt<DB>(dst, dio, i, j, v);
++}
++
++extern "C" {
++
++__global__ void CrabGeo_HPass8(const unsigned char *src, CrabGeoIO io, int r0, int rows,
++                               const int *idx, const float *w, int taps, float *hbuf, int pw)
++{
++    hpass<1>(src, io, r0, rows, idx, w, taps, hbuf, pw);
++}
++
++__global__ void CrabGeo_HPass16(const unsigned char *src, CrabGeoIO io, int r0, int rows,
++                                const int *idx, const float *w, int taps, float *hbuf, int pw)
++{
++    hpass<2>(src, io, r0, rows, idx, w, taps, hbuf, pw);
++}
++
++__global__ void CrabGeo_VPassOut8(const float *hbuf, int pw, int ph, int r0, const int *idx, const float *w,
++                                  int taps, const int *hidx, unsigned char *dst, CrabGeoIO io, float bg)
++{
++    vpass_out<1>(hbuf, pw, ph, r0, idx, w, taps, hidx, dst, io, bg);
++}
++
++__global__ void CrabGeo_VPassOut16(const float *hbuf, int pw, int ph, int r0, const int *idx, const float *w,
++                                   int taps, const int *hidx, unsigned char *dst, CrabGeoIO io, float bg)
++{
++    vpass_out<2>(hbuf, pw, ph, r0, idx, w, taps, hidx, dst, io, bg);
++}
++
++/* Lượt dọc -> float (cho lượt đổi màu); ngoài nội dung ghi `bg`. */
++__global__ void CrabGeo_VPassF(const float *__restrict__ hbuf, int pw, int ph, int r0,
++                               const int *__restrict__ idx, const float *__restrict__ w, int taps,
++                               const int *__restrict__ hidx, float *__restrict__ out, float bg)
++{
++    int i = blockIdx.x * blockDim.x + threadIdx.x;
++    int j = blockIdx.y * blockDim.y + threadIdx.y;
++    if (i >= pw || j >= ph)
++        return;
++    float v = bg;
++    if (idx[j] >= 0 && hidx[i] >= 0) {
++        v = 0.0f;
++        for (int t = 0; t < taps; t++)
++            v += w[t * ph + j] * hbuf[(idx[t * ph + j] - r0) * pw + i];
++    }
++    out[j * pw + i] = v;
++}
++
++#define COPY_KERNEL(SB, DB) \
++__global__ void CrabGeo_Copy_##SB##_##DB(const unsigned char *src, CrabGeoIO sio, unsigned char *dst, CrabGeoIO dio, \
++                                       int pw, int ph, int dx, int dy, int x0, int x1, int y0, int y1, float bg) \
++{ \
++    copy_plane<SB, DB>(src, sio, dst, dio, pw, ph, dx, dy, x0, x1, y0, y1, bg); \
++}
++COPY_KERNEL(1, 1)
++COPY_KERNEL(1, 2)
++COPY_KERNEL(2, 1)
++COPY_KERNEL(2, 2)
++
++/* Alpha hằng (nguồn không có alpha): trong nội dung 255, ngoài = bg. */
++__global__ void CrabGeo_FillAlpha(int pw, int ph, const int *__restrict__ hidx, const int *__restrict__ vidx,
++                                  unsigned char *dst, CrabGeoIO io, float bg)
++{
++    int i = blockIdx.x * blockDim.x + threadIdx.x;
++    int j = blockIdx.y * blockDim.y + threadIdx.y;
++    if (i >= pw || j >= ph)
++        return;
++    wr(dst, io, i, j, (hidx[i] >= 0 && vidx[j] >= 0) ? 255.0f : bg);
++}
++
++__device__ static inline float mat_row(const CrabGeoMat &m, int r, float a, float b, float c)
++{
++    return m.m[4 * r] * a + m.m[4 * r + 1] * b + m.m[4 * r + 2] * c + m.m[4 * r + 3];
++}
++
++__device__ static inline int clampi(int v, int lo, int hi)
++{
++    return v < lo ? lo : (v > hi ? hi : v);
++}
++
++/* Nguồn YUV khác ma trận: luma ra từ Y (cỡ luma) + U,V (cỡ màu ra) nội suy song tuyến tại vị trí
++ * luma. (cox, coy) = tâm mẫu màu 0 theo toạ độ liên tục luma; csx, csy = bước hạ mẫu (1 hoặc 2). */
++__global__ void CrabGeo_ConvYUVLuma(const float *__restrict__ Y, const float *__restrict__ U,
++                                    const float *__restrict__ V, int w, int h,
++                                    int cw, int ch, float csx, float csy, float cox, float coy,
++                                    const int *__restrict__ hidx, const int *__restrict__ vidx,
++                                    CrabGeoMat m, unsigned char *dst, CrabGeoIO io, float bg)
++{
++    int x = blockIdx.x * blockDim.x + threadIdx.x;
++    int y = blockIdx.y * blockDim.y + threadIdx.y;
++    if (x >= w || y >= h)
++        return;
++    float out = bg;
++    if (hidx[x] >= 0 && vidx[y] >= 0) {
++        float fx = (x + 0.5f - cox) / csx, fy = (y + 0.5f - coy) / csy;
++        int x0 = (int)floorf(fx), y0 = (int)floorf(fy);
++        float ax = fx - x0, ay = fy - y0;
++        int xa = clampi(x0, 0, cw - 1), xb = clampi(x0 + 1, 0, cw - 1);
++        int ya = clampi(y0, 0, ch - 1), yb = clampi(y0 + 1, 0, ch - 1);
++        float u = (1 - ay) * ((1 - ax) * U[ya * cw + xa] + ax * U[ya * cw + xb]) +
++                  ay * ((1 - ax) * U[yb * cw + xa] + ax * U[yb * cw + xb]);
++        float v = (1 - ay) * ((1 - ax) * V[ya * cw + xa] + ax * V[ya * cw + xb]) +
++                  ay * ((1 - ax) * V[yb * cw + xa] + ax * V[yb * cw + xb]);
++        out = mat_row(m, 0, Y[y * w + x], u, v);
++    }
++    wr(dst, io, x, y, out);
++}
++
++/* Nguồn YUV khác ma trận: màu ra từ U,V (cỡ màu) + Y trung bình các mẫu luma của khối. */
++__global__ void CrabGeo_ConvYUVChroma(const float *__restrict__ Y, const float *__restrict__ U,
++                                      const float *__restrict__ V, int w, int h,
++                                      int cw, int ch, int csx, int csy,
++                                      const int *__restrict__ hidx, const int *__restrict__ vidx,
++                                      CrabGeoMat m, unsigned char *dstu, CrabGeoIO iou,
++                                      unsigned char *dstv, CrabGeoIO iov)
++{
++    int x = blockIdx.x * blockDim.x + threadIdx.x;
++    int y = blockIdx.y * blockDim.y + threadIdx.y;
++    if (x >= cw || y >= ch)
++        return;
++    float uo = 128.0f, vo = 128.0f;
++    if (hidx[x] >= 0 && vidx[y] >= 0) {
++        float ys = 0.0f;
++        int n = 0;
++        for (int j = 0; j < csy; j++)
++            for (int i = 0; i < csx; i++) {
++                int lx = x * csx + i, ly = y * csy + j;
++                if (lx < w && ly < h) {
++                    ys += Y[ly * w + lx];
++                    n++;
++                }
++            }
++        float yy = n ? ys / n : 16.0f;
++        float u = U[y * cw + x], v = V[y * cw + x];
++        uo = mat_row(m, 1, yy, u, v);
++        vo = mat_row(m, 2, yy, u, v);
++    }
++    wr(dstu, iou, x, y, uo);
++    wr(dstv, iov, x, y, vo);
++}
++
++/* Nguồn RGB(A) (cỡ luma ra): Y (+ A) ra. */
++__global__ void CrabGeo_ConvRGBLuma(const float *__restrict__ R, const float *__restrict__ G,
++                                    const float *__restrict__ B, const float *A,
++                                    int w, int h, const int *__restrict__ hidx, const int *__restrict__ vidx,
++                                    CrabGeoMat m, unsigned char *dsty, CrabGeoIO ioy,
++                                    unsigned char *dsta, CrabGeoIO ioa, float bgy, float bga)
++{
++    int x = blockIdx.x * blockDim.x + threadIdx.x;
++    int y = blockIdx.y * blockDim.y + threadIdx.y;
++    if (x >= w || y >= h)
++        return;
++    int in = hidx[x] >= 0 && vidx[y] >= 0;
++    int k = y * w + x;
++    wr(dsty, ioy, x, y, in ? mat_row(m, 0, R[k], G[k], B[k]) : bgy);
++    if (dsta)
++        wr(dsta, ioa, x, y, in ? (A ? A[k] : 255.0f) : bga);
++}
++
++/* Nguồn RGB(A): màu ra = trung bình khối csx x csy luma (có trọng số alpha nếu wa). */
++__global__ void CrabGeo_ConvRGBChroma(const float *__restrict__ R, const float *__restrict__ G,
++                                      const float *__restrict__ B, const float *A,
++                                      int w, int h, int cw, int ch, int csx, int csy, int wa,
++                                      const int *__restrict__ hidx, const int *__restrict__ vidx,
++                                      CrabGeoMat m, unsigned char *dstu, CrabGeoIO iou,
++                                      unsigned char *dstv, CrabGeoIO iov)
++{
++    int x = blockIdx.x * blockDim.x + threadIdx.x;
++    int y = blockIdx.y * blockDim.y + threadIdx.y;
++    if (x >= cw || y >= ch)
++        return;
++    float su = 0.0f, sv = 0.0f, sw = 0.0f;
++    for (int j = 0; j < csy; j++)
++        for (int i = 0; i < csx; i++) {
++            int lx = x * csx + i, ly = y * csy + j;
++            if (lx >= w || ly >= h || hidx[lx] < 0 || vidx[ly] < 0)
++                continue;
++            int k = ly * w + lx;
++            float wt = 1.0f;
++            if (wa && A) {
++                wt = A[k];
++                wt = wt < 0.0f ? 0.0f : (wt > 255.0f ? 255.0f : wt);
++            }
++            su += wt * (mat_row(m, 1, R[k], G[k], B[k]) - 128.0f);
++            sv += wt * (mat_row(m, 2, R[k], G[k], B[k]) - 128.0f);
++            sw += wt;
++        }
++    float uo = 128.0f, vo = 128.0f;
++    if (sw > 0.0f) {
++        uo = 128.0f + su / sw;
++        vo = 128.0f + sv / sw;
++    }
++    wr(dstu, iou, x, y, uo);
++    wr(dstv, iov, x, y, vo);
++}
++
++}
+diff --git a/libavfilter/vf_crabgeo_cuda.h b/libavfilter/vf_crabgeo_cuda.h
+new file mode 100644
+index 0000000..3290abf
+--- /dev/null
++++ b/libavfilter/vf_crabgeo_cuda.h
+@@ -0,0 +1,42 @@
++/*
++ * CrabbyCut: hằng số + kiểu dùng chung giữa vf_crabgeo_cuda.c (host) và vf_crabgeo_cuda.cu.
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#ifndef AVFILTER_CRABGEO_CUDA_H
++#define AVFILTER_CRABGEO_CUDA_H
++
++#define CRABGEO_INTERP_BICUBIC  0
++#define CRABGEO_INTERP_BILINEAR 1
++#define CRABGEO_INTERP_NEAREST  2
++
++/* Cách đọc/ghi một thành phần trên một mặt phẳng: phần tử x của hàng y nằm ở
++ * base + y*linesize + (x*step + offset)*bytes. `norm` đổi mã <-> thang 8-bit (1 với 8-bit,
++ * 1/256 với 16-bit). Khi ghi: mã = v/norm + làm tròn, kẹp [0, maxval], AND mask. */
++typedef struct CrabGeoIO {
++    int linesize, step, offset, bytes;
++    float norm, maxval;
++    int mask;
++} CrabGeoIO;
++
++/* Ma trận 3x4 (thang 8-bit): out_i = m[4i]*a + m[4i+1]*b + m[4i+2]*c + m[4i+3]. */
++typedef struct CrabGeoMat {
++    float m[12];
++} CrabGeoMat;
++
++#endif /* AVFILTER_CRABGEO_CUDA_H */
+diff --git a/libavfilter/vf_hwdownload.c b/libavfilter/vf_hwdownload.c
+index e4c5c41..77c6744 100644
+--- a/libavfilter/vf_hwdownload.c
++++ b/libavfilter/vf_hwdownload.c
+@@ -125,10 +125,18 @@ static int hwdownload_filter_frame(AVFilterLink *link, AVFrame *input)
+         goto fail;
+     }
+     if ((void*)ctx->hwframes != input->hw_frames_ctx->data) {
+-        av_log(ctx, AV_LOG_ERROR, "Input frame is not the in the configured "
+-               "hwframe context.\n");
+-        err = AVERROR(EINVAL);
+-        goto fail;
++        /* CrabbyCut: bộ giải mã phần cứng khởi tạo lại (tua, đổi SPS) cho khung từ vùng nhớ MỚI
++         * cùng thiết bị/định dạng/cỡ — fftools đã không dựng lại đồ thị (ffmpeg_filter.c), nên ở
++         * đây nhận luôn thay vì báo lỗi. */
++        const AVHWFramesContext *in_fc = (const AVHWFramesContext *)input->hw_frames_ctx->data;
++        if (in_fc->device_ref->data != ctx->hwframes->device_ref->data ||
++            in_fc->format != ctx->hwframes->format || in_fc->sw_format != ctx->hwframes->sw_format ||
++            in_fc->width != ctx->hwframes->width || in_fc->height != ctx->hwframes->height) {
++            av_log(ctx, AV_LOG_ERROR, "Input frame is not the in the configured "
++                   "hwframe context.\n");
++            err = AVERROR(EINVAL);
++            goto fail;
++        }
+     }
+ 
+     output = ff_get_video_buffer(outlink, ctx->hwframes->width,
+diff --git a/libavutil/hwcontext_cuda.c b/libavutil/hwcontext_cuda.c
+index b0b65b2..c45131f 100644
+--- a/libavutil/hwcontext_cuda.c
++++ b/libavutil/hwcontext_cuda.c
+@@ -30,9 +30,20 @@
+ #include "pixfmt.h"
+ #include "imgutils.h"
+ 
++/* CrabbyCut: bộ đệm ghim cho tải lên (xem cuda_transfer_data). */
++#define CUDA_UPLOAD_SLOTS 4
++typedef struct CUDAUploadSlot {
++    uint8_t *host;
++    size_t size;
++    CUevent ev;
++    int pending;
++} CUDAUploadSlot;
++
+ typedef struct CUDAFramesContext {
+     int shift_width, shift_height;
+     int tex_alignment;
++    CUDAUploadSlot up[CUDA_UPLOAD_SLOTS];
++    int up_next;
+ } CUDAFramesContext;
+ 
+ typedef struct CUDADeviceContext {
+@@ -140,6 +151,30 @@ fail:
+     return ret;
+ }
+ 
++static void cuda_frames_uninit(AVHWFramesContext *ctx)
++{
++    CUDAFramesContext       *priv = ctx->hwctx;
++    AVHWDeviceContext *device_ctx = ctx->device_ctx;
++    AVCUDADeviceContext    *hwctx = device_ctx->hwctx;
++    CudaFunctions             *cu = hwctx->internal->cuda_dl;
++    CUcontext dummy;
++    int i;
++
++    if (CHECK_CU(cu->cuCtxPushCurrent(hwctx->cuda_ctx)) < 0)
++        return;
++    for (i = 0; i < CUDA_UPLOAD_SLOTS; i++) {
++        CUDAUploadSlot *u = &priv->up[i];
++        if (u->ev) {
++            CHECK_CU(cu->cuEventSynchronize(u->ev));
++            CHECK_CU(cu->cuEventDestroy(u->ev));
++        }
++        if (u->host)
++            CHECK_CU(cu->cuMemFreeHost(u->host));
++        memset(u, 0, sizeof(*u));
++    }
++    CHECK_CU(cu->cuCtxPopCurrent(&dummy));
++}
++
+ static int cuda_frames_init(AVHWFramesContext *ctx)
+ {
+     AVHWDeviceContext *device_ctx = ctx->device_ctx;
+@@ -254,12 +289,74 @@ static int cuda_transfer_data(AVHWFramesContext *ctx, AVFrame *dst,
+     if (ret < 0)
+         return ret;
+ 
++    /* CrabbyCut: TẢI LÊN qua bộ đệm ghim. cuMemcpy2DAsync từ bộ nhớ pageable ngầm chờ mọi việc
++     * trước đó trên stream chung (kernel của các bộ lọc khác) -> luồng lọc và GPU chờ nhau tuần
++     * tự. Chép vào bộ đệm ghim (memcpy CPU) rồi chép không đồng bộ: thứ tự vẫn trên stream chung,
++     * bộ đệm chỉ dùng lại sau khi event của lượt chép trước đã xong. */
++    if (!src->hw_frames_ctx && dst->hw_frames_ctx && cu->cuMemAllocHost && cu->cuMemFreeHost) {
++        CUDAUploadSlot *u = &priv->up[priv->up_next];
++        size_t off[4] = { 0 }, wb[4] = { 0 }, rows[4] = { 0 }, need = 0;
++        int np = 0;
++        priv->up_next = (priv->up_next + 1) % CUDA_UPLOAD_SLOTS;
++        for (i = 0; i < FF_ARRAY_ELEMS(src->data) && i < 4 && src->data[i]; i++) {
++            wb[i]   = FFMIN(src->linesize[i], dst->linesize[i]);
++            rows[i] = AV_CEIL_RSHIFT(src->height, (i == 0 || i == 3) ? 0 : priv->shift_height);
++            off[i]  = need;
++            need   += FFALIGN(wb[i] * rows[i], 256);
++            np = i + 1;
++        }
++        if (u->pending) {
++            ret = CHECK_CU(cu->cuEventSynchronize(u->ev));
++            if (ret < 0)
++                goto exit;
++            u->pending = 0;
++        }
++        if (u->size < need) {
++            if (u->host)
++                CHECK_CU(cu->cuMemFreeHost(u->host));
++            u->host = NULL;
++            u->size = 0;
++            ret = CHECK_CU(cu->cuMemAllocHost((void **)&u->host, need));
++            if (ret < 0)
++                goto exit;
++            u->size = need;
++        }
++        if (!u->ev) {
++            ret = CHECK_CU(cu->cuEventCreate(&u->ev, CU_EVENT_DISABLE_TIMING));
++            if (ret < 0)
++                goto exit;
++        }
++        for (i = 0; i < np; i++) {
++            CUDA_MEMCPY2D cpy = {
++                .srcMemoryType = CU_MEMORYTYPE_HOST,
++                .srcHost       = u->host + off[i],
++                .srcPitch      = wb[i],
++                .dstMemoryType = CU_MEMORYTYPE_DEVICE,
++                .dstDevice     = (CUdeviceptr)dst->data[i],
++                .dstPitch      = dst->linesize[i],
++                .WidthInBytes  = wb[i],
++                .Height        = rows[i],
++            };
++            av_image_copy_plane(u->host + off[i], wb[i], src->data[i], src->linesize[i], wb[i], rows[i]);
++            ret = CHECK_CU(cu->cuMemcpy2DAsync(&cpy, hwctx->stream));
++            if (ret < 0)
++                goto exit;
++        }
++        ret = CHECK_CU(cu->cuEventRecord(u->ev, hwctx->stream));
++        if (ret < 0)
++            goto exit;
++        u->pending = 1;
++        goto exit;
++    }
++
+     for (i = 0; i < FF_ARRAY_ELEMS(src->data) && src->data[i]; i++) {
+         CUDA_MEMCPY2D cpy = {
+             .srcPitch      = src->linesize[i],
+             .dstPitch      = dst->linesize[i],
+             .WidthInBytes  = FFMIN(src->linesize[i], dst->linesize[i]),
+-            .Height        = src->height >> ((i == 0 || i == 3) ? 0 : priv->shift_height),
++            /* CrabbyCut: làm tròn LÊN — cao lẻ thì mặt phẳng màu có ceil(h/2) hàng; `>>` bỏ mất
++             * hàng cuối (lớp phủ yuva420p cao 201 ra hàng màu cuối rác). */
++            .Height        = AV_CEIL_RSHIFT(src->height, (i == 0 || i == 3) ? 0 : priv->shift_height),
+         };
+ 
+         if (src->hw_frames_ctx) {
+@@ -582,6 +679,7 @@ const HWContextType ff_hwcontext_type_cuda = {
+     .device_uninit        = cuda_device_uninit,
+     .frames_get_constraints = cuda_frames_get_constraints,
+     .frames_init          = cuda_frames_init,
++    .frames_uninit        = cuda_frames_uninit,
+     .frames_get_buffer    = cuda_get_buffer,
+     .transfer_get_formats = cuda_transfer_get_formats,
+     .transfer_data_to     = cuda_transfer_data,
