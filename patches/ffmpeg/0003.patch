@@ -1,0 +1,548 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "Tam Pham (Windows)" <tampham.designer92@gmail.com>
+Date: Sat, 3 Oct 2026 14:01:19 +0700
+Subject: [PATCH 3/3] =?UTF-8?q?CrabbyCut:=20crabgeo=5Fcuda=20=E2=80=94=20L?=
+ =?UTF-8?q?UT=203D=20(lut/lut2/mix)=20=C3=A1p=20l=C3=AAn=20n=E1=BB=99i=20d?=
+ =?UTF-8?q?ung=20sau=20ph=C3=A9p=20co?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Thay cho chuỗi split -> lut3d A / lut3d B -> blend all_opacity (lớp Điều chỉnh có keyframe
+cường độ LUT) và một lut3d (HSL + LUT đã bake) của đường CPU CrabbyCut. Nội suy ba chiều như
+lut3d interp=trilinear, tính float từ khung nguồn (không qua RGB 8-bit). `mix` là biểu thức theo
+t/n tính mỗi khung. Nguồn YUV: màu của điểm luma = mẫu màu của khối (lặp ô), sau LUT hạ mẫu bằng
+trung bình khối 2x2 — gần cách swscale làm nhất trong các cách đã đo.
+---
+ libavfilter/vf_crabgeo_cuda.c  | 265 +++++++++++++++++++++++++++++++--
+ libavfilter/vf_crabgeo_cuda.cu | 104 +++++++++++++
+ 2 files changed, 358 insertions(+), 11 deletions(-)
+
+diff --git a/libavfilter/vf_crabgeo_cuda.c b/libavfilter/vf_crabgeo_cuda.c
+index e6adea9..2ad66f7 100644
+--- a/libavfilter/vf_crabgeo_cuda.c
++++ b/libavfilter/vf_crabgeo_cuda.c
+@@ -16,6 +16,13 @@
+  *   alpha_chroma                 màu 4:2:0 của nguồn RGBA = trung bình theo trọng số alpha
+  *   passthrough                  không đổi gì thì trả nguyên khung (0 = luôn chép sang vùng nhớ
+  *                                của bộ lọc, vd. để NVENC chỉ thấy MỘT vùng nhớ)
++ *   lut, lut2, mix               LUT 3D (.cube) áp lên NỘI DUNG sau phép co, giữa bước đổi sang RGB
++ *                                và bước đổi sang định dạng ra — thay cho chuỗi
++ *                                `split -> lut3d A / lut3d B -> blend all_opacity` (lớp Điều chỉnh có
++ *                                keyframe cường độ LUT) hoặc một `lut3d` của đường CPU. Nội suy ba chiều
++ *                                như lut3d interp=trilinear, tính float (không qua RGB 8-bit). `mix`:
++ *                                biểu thức theo t (giây của khung), n — tính mỗi khung, kẹp [0,1]; có
++ *                                lut2: lut + (lut2 - lut)*mix; không có: gốc + (lut - gốc)*mix.
+  *   sync                         chờ GPU xong khung rồi mới đưa đi (mặc định 1). Để luồng lọc chạy
+  *                                trước GPU thì bản xuất có khung RÁCH/lệch thời gian: NVENC đọc khung
+  *                                đuôi khi kernel chép chưa xong (phần trên của khung cũ), lớp phủ chữ
+@@ -48,9 +55,15 @@
+ #include <math.h>
+ #include <string.h>
+ 
++#include <errno.h>
++#include <stdio.h>
++#include <stdlib.h>
++
+ #include "libavutil/avassert.h"
++#include "libavutil/avstring.h"
+ #include "libavutil/cuda_check.h"
+ #include "libavutil/eval.h"
++#include "libavutil/file_open.h"
+ #include "libavutil/hwcontext.h"
+ #include "libavutil/hwcontext_cuda_internal.h"
+ #include "libavutil/log.h"
+@@ -93,13 +106,27 @@ typedef struct AxisTable {
+ } AxisTable;
+ 
+ enum { FN_HPASS8, FN_HPASS16, FN_VOUT8, FN_VOUT16, FN_VF, FN_COPY11, FN_COPY12, FN_COPY21, FN_COPY22,
+-       FN_FILLA, FN_YUVL, FN_YUVC, FN_RGBL, FN_RGBC, FN_NB };
++       FN_FILLA, FN_YUVL, FN_YUVC, FN_RGBL, FN_RGBC, FN_LUTRGB, FN_LUTYUV, FN_NB };
+ static const char *const fn_names[FN_NB] = {
+     "CrabGeo_HPass8", "CrabGeo_HPass16", "CrabGeo_VPassOut8", "CrabGeo_VPassOut16", "CrabGeo_VPassF",
+     "CrabGeo_Copy_1_1", "CrabGeo_Copy_1_2", "CrabGeo_Copy_2_1", "CrabGeo_Copy_2_2", "CrabGeo_FillAlpha",
+     "CrabGeo_ConvYUVLuma", "CrabGeo_ConvYUVChroma", "CrabGeo_ConvRGBLuma", "CrabGeo_ConvRGBChroma",
++    "CrabGeo_LutRGB", "CrabGeo_LutYUV",
+ };
+ 
++#define LUT_MAX_SIZE 256   /* như MAX_LEVEL của vf_lut3d */
++
++/* Một LUT 3D đọc từ .cube: n^3 ô float4 (r, g, b, 0) theo thứ tự tệp, `scale` theo DOMAIN. */
++typedef struct CubeLut {
++    int n;
++    float scale[3];
++    float *host;
++    CUdeviceptr dev;
++} CubeLut;
++
++static const char *const mix_names[] = { "t", "n", NULL };
++enum { MIX_T, MIX_N, MIX_NB };
++
+ /* Chép thẳng một mặt phẳng: mẫu ra (i, j) <- nguồn (i - dx, j - dy) khi i in [x0,x1), j in [y0,y1). */
+ typedef struct CopyPlan {
+     int ok, dx, dy, x0, x1, y0, y1;
+@@ -134,8 +161,13 @@ typedef struct CrabGeoCUDAContext {
+     int tables_loc;               ///< vị trí mẫu màu nguồn mà bảng cx/cy đang dựng theo (-1: chưa)
+     CUdeviceptr hbuf;
+     size_t hbuf_size;
+-    CUdeviceptr fplane[4];        ///< mặt phẳng float trung gian (đổi màu)
+-    size_t fplane_size[4];
++    CUdeviceptr fplane[8];        ///< mặt phẳng float trung gian (đổi màu; 4..6 = RGB sau LUT)
++    size_t fplane_size[8];
++
++    char *lut_file, *lut2_file, *mix_expr;
++    CubeLut lut[2];
++    AVExpr *mix_pexpr;
++    int64_t frame_count;
+ } CrabGeoCUDAContext;
+ 
+ static int fmt_in_list(const enum AVPixelFormat *list, enum AVPixelFormat f)
+@@ -369,6 +401,107 @@ static int build_tables(AVFilterContext *avctx, enum AVChromaLocation loc)
+     return 0;
+ }
+ 
++/* Đọc .cube giống parse_cube của vf_lut3d: bỏ qua TITLE/chú thích/từ khoá khác, DOMAIN_MIN/MAX ->
++ * scale = clip(1/(max-min), 0, 1) (lut3d cũng chỉ co, không dời theo min), sau LUT_3D_SIZE là n^3
++ * bộ ba r g b, r chạy nhanh nhất. */
++static int load_cube(AVFilterContext *avctx, const char *path, CubeLut *lut)
++{
++    char line[512];
++    float minv[3] = { 0.0f, 0.0f, 0.0f }, maxv[3] = { 1.0f, 1.0f, 1.0f };
++    int n = 0, total = 0, count = 0, ret = 0;
++    FILE *f = avpriv_fopen_utf8(path, "r");
++
++    if (!f) {
++        ret = AVERROR(errno);
++        av_log(avctx, AV_LOG_ERROR, "%s: cannot open LUT file\n", path);
++        return ret;
++    }
++    while (count < total || !total) {
++        const char *p = line;
++        float r, g, b;
++        if (!fgets(line, sizeof(line), f))
++            break;
++        while (*p == ' ' || *p == '\t')
++            p++;
++        if (!*p || *p == '#' || *p == '\n' || *p == '\r')
++            continue;
++        if (!strncmp(p, "DOMAIN_MIN", 10) || !strncmp(p, "DOMAIN_MAX", 10)) {
++            float *v = p[8] == 'I' ? minv : maxv;
++            if (av_sscanf(p + 10, "%f %f %f", v, v + 1, v + 2) != 3) {
++                ret = AVERROR_INVALIDDATA;
++                goto end;
++            }
++            continue;
++        }
++        if (!strncmp(p, "LUT_3D_SIZE", 11)) {
++            n = strtol(p + 11, NULL, 0);
++            if (n < 2 || n > LUT_MAX_SIZE || lut->host) {
++                av_log(avctx, AV_LOG_ERROR, "%s: invalid LUT_3D_SIZE\n", path);
++                ret = AVERROR_INVALIDDATA;
++                goto end;
++            }
++            total = n * n * n;
++            lut->host = av_malloc_array(total, 4 * sizeof(float));
++            if (!lut->host) {
++                ret = AVERROR(ENOMEM);
++                goto end;
++            }
++            continue;
++        }
++        if ((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z'))
++            continue;   /* TITLE, LUT_3D_INPUT_RANGE... */
++        if (!lut->host || av_sscanf(p, "%f %f %f", &r, &g, &b) != 3) {
++            ret = AVERROR_INVALIDDATA;
++            goto end;
++        }
++        lut->host[4 * count + 0] = r;
++        lut->host[4 * count + 1] = g;
++        lut->host[4 * count + 2] = b;
++        lut->host[4 * count + 3] = 0.0f;
++        count++;
++    }
++    if (!total || count != total) {
++        ret = AVERROR_INVALIDDATA;
++        goto end;
++    }
++    lut->n = n;
++    for (int i = 0; i < 3; i++)
++        lut->scale[i] = av_clipf(1.0f / (maxv[i] - minv[i]), 0.0f, 1.0f);
++end:
++    if (ret == AVERROR_INVALIDDATA)
++        av_log(avctx, AV_LOG_ERROR, "%s: invalid .cube file\n", path);
++    fclose(f);
++    return ret;
++}
++
++static av_cold int crabgeo_init(AVFilterContext *avctx)
++{
++    CrabGeoCUDAContext *s = avctx->priv;
++    int ret;
++
++    if (!s->lut_file || !*s->lut_file) {
++        if (s->lut2_file && *s->lut2_file) {
++            av_log(avctx, AV_LOG_ERROR, "lut2 needs lut\n");
++            return AVERROR(EINVAL);
++        }
++        return 0;
++    }
++    if ((ret = load_cube(avctx, s->lut_file, &s->lut[0])) < 0)
++        return ret;
++    if (s->lut2_file && *s->lut2_file) {
++        if ((ret = load_cube(avctx, s->lut2_file, &s->lut[1])) < 0)
++            return ret;
++        if (s->lut[1].n != s->lut[0].n) {
++            av_log(avctx, AV_LOG_ERROR, "lut and lut2 must have the same LUT_3D_SIZE\n");
++            return AVERROR(EINVAL);
++        }
++    }
++    ret = av_expr_parse(&s->mix_pexpr, s->mix_expr, mix_names, NULL, NULL, NULL, NULL, 0, avctx);
++    if (ret < 0)
++        av_log(avctx, AV_LOG_ERROR, "Invalid mix expression '%s'\n", s->mix_expr);
++    return ret;
++}
++
+ static av_cold void crabgeo_uninit(AVFilterContext *avctx)
+ {
+     CrabGeoCUDAContext *s = avctx->priv;
+@@ -382,13 +515,20 @@ static av_cold void crabgeo_uninit(AVFilterContext *avctx)
+         free_axis(avctx, &s->cy);
+         if (s->hbuf)
+             CHECK_CU(cu->cuMemFree(s->hbuf));
+-        for (int i = 0; i < 4; i++)
++        for (int i = 0; i < FF_ARRAY_ELEMS(s->fplane); i++)
+             if (s->fplane[i])
+                 CHECK_CU(cu->cuMemFree(s->fplane[i]));
++        for (int i = 0; i < 2; i++)
++            if (s->lut[i].dev)
++                CHECK_CU(cu->cuMemFree(s->lut[i].dev));
+         if (s->cu_module)
+             CHECK_CU(cu->cuModuleUnload(s->cu_module));
+         CHECK_CU(cu->cuCtxPopCurrent(&dummy));
+     }
++    for (int i = 0; i < 2; i++)
++        av_freep(&s->lut[i].host);
++    av_expr_free(s->mix_pexpr);
++    s->mix_pexpr = NULL;
+     av_buffer_unref(&s->frames_ctx);
+ }
+ 
+@@ -475,7 +615,7 @@ static int config_output(AVFilterLink *outlink)
+     s->dst_sy = dout->log2_chroma_h;
+     s->out_cw = AV_CEIL_RSHIFT(s->ow, s->dst_sx);
+     s->out_ch = AV_CEIL_RSHIFT(s->oh, s->dst_sy);
+-    s->passthrough_geom = s->passthrough && s->in_fmt == s->out_fmt &&
++    s->passthrough_geom = s->passthrough && !s->lut[0].host && s->in_fmt == s->out_fmt &&
+                           s->ow == inlink->w && s->oh == inlink->h && s->w == inlink->w &&
+                           s->h == inlink->h && s->x == 0 && s->y == 0 && s->crop_x == 0 &&
+                           s->crop_y == 0 && s->crop_w == inlink->w && s->crop_h == inlink->h;
+@@ -512,6 +652,15 @@ static int config_output(AVFilterLink *outlink)
+                                   ff_vf_crabgeo_cuda_ptx_data, ff_vf_crabgeo_cuda_ptx_len);
+     for (int i = 0; ret >= 0 && i < FN_NB; i++)
+         ret = CHECK_CU(cu->cuModuleGetFunction(&s->fn[i], s->cu_module, fn_names[i]));
++    for (int i = 0; ret >= 0 && i < 2; i++) {
++        CubeLut *lut = &s->lut[i];
++        size_t bytes = (size_t)lut->n * lut->n * lut->n * 4 * sizeof(float);
++        if (!lut->host || lut->dev)
++            continue;
++        ret = CHECK_CU(cu->cuMemAlloc(&lut->dev, bytes));
++        if (ret >= 0)
++            ret = CHECK_CU(cu->cuMemcpyHtoD(lut->dev, lut->host, bytes));
++    }
+     free_axis(avctx, &s->lx);
+     free_axis(avctx, &s->ly);
+     s->tables_loc = -1;
+@@ -594,6 +743,27 @@ static void build_matrix(CrabGeoMat *out, int src_rgb, int in_mat, int in_rng, i
+         }
+ }
+ 
++/* YUV nguồn -> RGB thang 0..255 (cho bước LUT). Cùng hệ số với nửa đầu của build_matrix. */
++static void build_to_rgb(CrabGeoMat *out, int in_mat, int in_rng)
++{
++    const double ys = in_rng == RNG_TV ? 255.0 / 219.0 : 1.0;
++    const double yo = in_rng == RNG_TV ? -16.0 : 0.0;
++    const double cs = in_rng == RNG_TV ? 255.0 / 224.0 : 1.0;
++    double kr, kb, kg, rcr, bcb, gcb, gcr, a[3][4];
++    mat_coeffs(in_mat, &kr, &kb);
++    kg = 1.0 - kr - kb;
++    rcr = 2 * (1 - kr);
++    bcb = 2 * (1 - kb);
++    gcb = -kb * bcb / kg;
++    gcr = -kr * rcr / kg;
++    a[0][0] = ys; a[0][1] = 0;        a[0][2] = rcr * cs; a[0][3] = ys * yo - rcr * cs * 128;
++    a[1][0] = ys; a[1][1] = gcb * cs; a[1][2] = gcr * cs; a[1][3] = ys * yo - (gcb + gcr) * cs * 128;
++    a[2][0] = ys; a[2][1] = bcb * cs; a[2][2] = 0;        a[2][3] = ys * yo - bcb * cs * 128;
++    for (int i = 0; i < 3; i++)
++        for (int j = 0; j < 4; j++)
++            out->m[4 * i + j] = (float)a[i][j];
++}
++
+ static CrabGeoIO io_of(const AVFrame *f, int plane, int step, int offset, int bytes, int p010)
+ {
+     CrabGeoIO io = {
+@@ -716,13 +886,20 @@ static int resample_to_float(AVFilterContext *avctx, const AVFrame *in, int c, A
+     return vpass(avctx, tx, ty, NULL, 0, s->fplane[slot], 0.0f);
+ }
+ 
+-static int process(AVFilterContext *avctx, const AVFrame *in, AVFrame *out, int identity, CrabGeoMat *m)
++/* m: nguồn -> ra (nguồn RGB: RGB -> YUV ra). Có LUT và nguồn YUV: m_in = YUV nguồn -> RGB 0..255,
++ * m = RGB -> YUV ra. */
++static int process(AVFilterContext *avctx, const AVFrame *in, AVFrame *out, int identity, CrabGeoMat *m,
++                   CrabGeoMat *m_in, float mix)
+ {
+     CrabGeoCUDAContext *s = avctx->priv;
+     const float bgy = s->out_range == RNG_TV ? 16.0f : 0.0f;
+     const float bga = s->bg == BG_TRANSPARENT ? 0.0f : 255.0f;
++    const int has_lut = !!s->lut[0].dev;
+     CUdeviceptr dy, du, dv, da = 0;
+     CrabGeoIO ioy, iou, iov, ioa = { 0 };
++    CUdeviceptr luta = s->lut[0].dev, lutb = s->lut[1].dev;
++    int lutn = s->lut[0].n;
++    float *sa = s->lut[0].scale, *sb = s->lut[1].host ? s->lut[1].scale : s->lut[0].scale;
+     int ret;
+ 
+     if ((ret = component(out, s->out_fmt, 0, &dy, &ioy)) < 0 ||
+@@ -740,6 +917,12 @@ static int process(AVFilterContext *avctx, const AVFrame *in, AVFrame *out, int
+             if ((ret = resample_to_float(avctx, in, c, &s->lx, &s->ly, c)) < 0)
+                 return ret;
+         A = s->src_alpha ? s->fplane[3] : 0;
++        if (has_lut) {
++            void *args[] = { &s->fplane[0], &s->fplane[1], &s->fplane[2], &w, &h, &s->lx.idx, &s->ly.idx,
++                             &luta, &lutb, &lutn, &sa[0], &sa[1], &sa[2], &sb[0], &sb[1], &sb[2], &mix };
++            if ((ret = launch(avctx, FN_LUTRGB, w, h, args)) < 0)
++                return ret;
++        }
+         {
+             void *args[] = { &s->fplane[0], &s->fplane[1], &s->fplane[2], &A, &w, &h,
+                              &s->lx.idx, &s->ly.idx, m,
+@@ -755,7 +938,52 @@ static int process(AVFilterContext *avctx, const AVFrame *in, AVFrame *out, int
+         }
+     }
+ 
+-    if (identity) {
++    if (has_lut) {
++        /* Nguồn YUV + LUT: Y/U/V về float ở lưới ra -> LUT ra RGB cỡ luma (mặt phẳng 4..6) -> đổi
++         * sang YUV ra như nguồn RGB không alpha (alpha của nguồn YUVA xử lý ở dưới như cũ). */
++        int w = s->ow, h = s->oh, cw = s->out_cw, ch = s->out_ch;
++        int csxi = 1 << s->dst_sx, csyi = 1 << s->dst_sy;
++        float csx = csxi, csy = csyi;
++        CUdeviceptr none = 0;
++        CrabGeoIO noio = { 0 };
++        double dox, doy;
++        chroma_offsets(s->dst_sx, s->dst_sy, AVCHROMA_LOC_LEFT, &dox, &doy);
++        for (int k = 4; k < 7; k++)
++            if ((ret = ensure_buffer(avctx, &s->fplane[k], &s->fplane_size[k], (size_t)w * h * sizeof(float))) < 0)
++                return ret;
++        if ((ret = resample_to_float(avctx, in, 0, &s->lx, &s->ly, 0)) < 0 ||
++            (ret = resample_to_float(avctx, in, 1, &s->cx, &s->cy, 1)) < 0 ||
++            (ret = resample_to_float(avctx, in, 2, &s->cx, &s->cy, 2)) < 0)
++            return ret;
++        {
++            /* mẫu màu ra của nội dung: tâm mẫu i ở dox + i*csx (luma) nằm trong [x, x + w) */
++            int cxlo = av_clip((int)ceil((s->x - dox) / csxi), 0, cw - 1);
++            int cxhi = av_clip((int)ceil((s->x + s->w - dox) / csxi) - 1, cxlo, cw - 1);
++            int cylo = av_clip((int)ceil((s->y - doy) / csyi), 0, ch - 1);
++            int cyhi = av_clip((int)ceil((s->y + s->h - doy) / csyi) - 1, cylo, ch - 1);
++            void *args[] = { &s->fplane[0], &s->fplane[1], &s->fplane[2], &w, &h, &cw, &ch,
++                             &csx, &csy, &cxlo, &cxhi, &cylo, &cyhi, &s->lx.idx, &s->ly.idx, m_in,
++                             &s->fplane[4], &s->fplane[5], &s->fplane[6],
++                             &luta, &lutb, &lutn, &sa[0], &sa[1], &sa[2], &sb[0], &sb[1], &sb[2], &mix };
++            if ((ret = launch(avctx, FN_LUTYUV, w, h, args)) < 0)
++                return ret;
++        }
++        {
++            void *args[] = { &s->fplane[4], &s->fplane[5], &s->fplane[6], &none, &w, &h,
++                             &s->lx.idx, &s->ly.idx, m,
++                             &dy, &ioy, &none, &noio, (void *)&bgy, (void *)&bga };
++            if ((ret = launch(avctx, FN_RGBL, w, h, args)) < 0)
++                return ret;
++        }
++        {
++            int wa = 0;
++            void *args[] = { &s->fplane[4], &s->fplane[5], &s->fplane[6], &none, &w, &h, &cw, &ch,
++                             &csxi, &csyi, &wa, &s->lx.idx, &s->ly.idx, m,
++                             &du, &iou, &dv, &iov };
++            if ((ret = launch(avctx, FN_RGBC, cw, ch, args)) < 0)
++                return ret;
++        }
++    } else if (identity) {
+         for (int c = 0; c < 3; c++) {
+             const CopyPlan *cp = c ? &s->copy_c : &s->copy_l;
+             AxisTable *tx = c ? &s->cx : &s->lx, *ty = c ? &s->cy : &s->ly;
+@@ -821,14 +1049,23 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
+     CudaFunctions *cu = s->hwctx->internal->cuda_dl;
+     AVFrame *out = NULL;
+     CUcontext dummy;
+-    CrabGeoMat m;
++    CrabGeoMat m, m_in;
++    float mix = 1.0f;
+     int in_mat, in_rng, identity, ret;
+ 
+     in_mat = frame_matrix(in, s->in_matrix);
+     in_rng = frame_range(in, s->in_range);
+-    identity = !s->src_rgb && in_mat == s->out_matrix && in_rng == s->out_range;
++    identity = !s->src_rgb && !s->lut[0].host && in_mat == s->out_matrix && in_rng == s->out_range;
+     if (s->passthrough_geom && identity)
+         return ff_filter_frame(outlink, in);
++    if (s->mix_pexpr) {
++        double vals[MIX_NB];
++        vals[MIX_T] = in->pts == AV_NOPTS_VALUE ? NAN : in->pts * av_q2d(inlink->time_base);
++        vals[MIX_N] = s->frame_count;
++        double v = av_expr_eval(s->mix_pexpr, vals, NULL);
++        mix = isnan(v) ? 0.0f : av_clipf((float)v, 0.0f, 1.0f);
++    }
++    s->frame_count++;
+ 
+     out = av_frame_alloc();
+     if (!out) {
+@@ -844,7 +1081,9 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
+     out->width  = s->ow;
+     out->height = s->oh;
+     out->crop_top = out->crop_bottom = out->crop_left = out->crop_right = 0;
+-    build_matrix(&m, s->src_rgb, in_mat, in_rng, s->out_matrix, s->out_range);
++    /* LUT trên nguồn YUV: nguồn -> RGB (m_in), LUT, RGB -> ra (m dựng như nguồn RGB). */
++    build_matrix(&m, s->src_rgb || s->lut[0].host, in_mat, in_rng, s->out_matrix, s->out_range);
++    build_to_rgb(&m_in, in_mat, in_rng);
+ 
+     ret = CHECK_CU(cu->cuCtxPushCurrent(s->hwctx->cuda_ctx));
+     if (ret < 0)
+@@ -852,7 +1091,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
+     if (s->tables_loc != (int)in->chroma_location || !s->lx.idx)
+         ret = build_tables(avctx, in->chroma_location);
+     if (ret >= 0)
+-        ret = process(avctx, in, out, identity, &m);
++        ret = process(avctx, in, out, identity, &m, &m_in, mix);
+     if (ret >= 0 && s->sync)
+         ret = CHECK_CU(cu->cuStreamSynchronize(s->cu_stream));
+     CHECK_CU(cu->cuCtxPopCurrent(&dummy));
+@@ -932,6 +1171,9 @@ static const AVOption crabgeo_cuda_options[] = {
+     { "alpha_chroma", "alpha-weighted 4:2:0 chroma", OFFSET(alpha_chroma), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, FLAGS },
+     { "passthrough", "pass frames through when nothing changes", OFFSET(passthrough), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, FLAGS },
+     { "sync", "wait for the GPU to finish each output frame", OFFSET(sync), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, FLAGS },
++    { "lut",  "3D LUT (.cube) applied to the content", OFFSET(lut_file), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, FLAGS },
++    { "lut2", "second 3D LUT (.cube), mixed with lut by mix", OFFSET(lut2_file), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, FLAGS },
++    { "mix",  "LUT mix (expression of t, n; clipped to [0,1])", OFFSET(mix_expr), AV_OPT_TYPE_STRING, { .str = "1" }, 0, 0, FLAGS },
+     { NULL },
+ };
+ 
+@@ -950,6 +1192,7 @@ const FFFilter ff_vf_crabgeo_cuda = {
+     .p.description  = NULL_IF_CONFIG_SMALL("CrabbyCut: crop, scale, colour-convert and place video using CUDA"),
+     .p.priv_class   = &crabgeo_cuda_class,
+     .priv_size      = sizeof(CrabGeoCUDAContext),
++    .init           = crabgeo_init,
+     .uninit         = crabgeo_uninit,
+     FILTER_INPUTS(crabgeo_cuda_inputs),
+     FILTER_OUTPUTS(crabgeo_cuda_outputs),
+diff --git a/libavfilter/vf_crabgeo_cuda.cu b/libavfilter/vf_crabgeo_cuda.cu
+index 1757b9a..a198b86 100644
+--- a/libavfilter/vf_crabgeo_cuda.cu
++++ b/libavfilter/vf_crabgeo_cuda.cu
+@@ -307,4 +307,108 @@ __global__ void CrabGeo_ConvRGBChroma(const float *__restrict__ R, const float *
+     wr(dstv, iov, x, y, vo);
+ }
+ 
++/* LUT 3D (tuỳ chọn lut/lut2/mix) — nội suy ba chiều đúng như `lut3d=interp=trilinear`: chỉ số
++ * pos = v * scale * (n-1), prev = (int)pos, next = min(prev+1, n-1), trộn theo r rồi g rồi b.
++ * Bảng xếp theo thứ tự tệp .cube (r nhanh nhất): ô (r, g, b) ở r + n*(g + n*b). v thang 0..1 đã kẹp. */
++typedef struct LutVec {
++    float x, y, z;
++} LutVec;
++
++__device__ static inline LutVec lut_vec(float x, float y, float z)
++{
++    LutVec v = { x, y, z };
++    return v;
++}
++
++__device__ static inline LutVec lut_lerp(LutVec a, LutVec b, float t)
++{
++    return lut_vec(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, a.z + (b.z - a.z) * t);
++}
++
++__device__ static inline LutVec lut_at(const float4 *__restrict__ lut, int n, int r, int g, int b)
++{
++    float4 v = lut[r + n * (g + n * b)];
++    return lut_vec(v.x, v.y, v.z);
++}
++
++__device__ static LutVec lut_sample(const float4 *__restrict__ lut, int n, float sr, float sg, float sb,
++                                    float r, float g, float b)
++{
++    const float m = (float)(n - 1);
++    float pr = r * sr * m, pg = g * sg * m, pb = b * sb * m;
++    int r0 = (int)pr, g0 = (int)pg, b0 = (int)pb;
++    int r1 = min(r0 + 1, n - 1), g1 = min(g0 + 1, n - 1), b1 = min(b0 + 1, n - 1);
++    float dr = pr - r0, dg = pg - g0, db = pb - b0;
++    LutVec c00 = lut_lerp(lut_at(lut, n, r0, g0, b0), lut_at(lut, n, r1, g0, b0), dr);
++    LutVec c10 = lut_lerp(lut_at(lut, n, r0, g1, b0), lut_at(lut, n, r1, g1, b0), dr);
++    LutVec c01 = lut_lerp(lut_at(lut, n, r0, g0, b1), lut_at(lut, n, r1, g0, b1), dr);
++    LutVec c11 = lut_lerp(lut_at(lut, n, r0, g1, b1), lut_at(lut, n, r1, g1, b1), dr);
++    return lut_lerp(lut_lerp(c00, c10, dg), lut_lerp(c01, c11, dg), db);
++}
++
++__device__ static inline float clamp01(float v)
++{
++    return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
++}
++
++/* (R,G,B) thang 0..255 -> qua LUT -> thang 0..255. Có lutb: A + (B - A)*mix (như blend normal
++ * all_opacity=mix với ngõ đầu là B); không có: gốc + (A - gốc)*mix. */
++__device__ static LutVec apply_luts(const float4 *__restrict__ luta, const float4 *__restrict__ lutb, int n,
++                                    float ar, float ag, float ab, float br, float bg, float bb, float mix,
++                                    float R, float G, float B)
++{
++    float r = clamp01(R * (1.0f / 255.0f)), g = clamp01(G * (1.0f / 255.0f)), b = clamp01(B * (1.0f / 255.0f));
++    LutVec a = lut_sample(luta, n, ar, ag, ab, r, g, b);
++    LutVec o = lutb ? lut_lerp(a, lut_sample(lutb, n, br, bg, bb, r, g, b), mix)
++                    : lut_lerp(lut_vec(r, g, b), a, mix);
++    return lut_vec(o.x * 255.0f, o.y * 255.0f, o.z * 255.0f);
++}
++
++/* Nguồn RGB(A): LUT tại chỗ trên ba mặt phẳng float (cỡ luma ra), chỉ trong nội dung. */
++__global__ void CrabGeo_LutRGB(float *R, float *G, float *B, int w, int h,
++                               const int *__restrict__ hidx, const int *__restrict__ vidx,
++                               const float4 *luta, const float4 *lutb, int n,
++                               float ar, float ag, float ab, float br, float bg, float bb, float mix)
++{
++    int x = blockIdx.x * blockDim.x + threadIdx.x;
++    int y = blockIdx.y * blockDim.y + threadIdx.y;
++    if (x >= w || y >= h || hidx[x] < 0 || vidx[y] < 0)
++        return;
++    int k = y * w + x;
++    LutVec o = apply_luts(luta, lutb, n, ar, ag, ab, br, bg, bb, mix, R[k], G[k], B[k]);
++    R[k] = o.x;
++    G[k] = o.y;
++    B[k] = o.z;
++}
++
++/* Nguồn YUV: tại mỗi mẫu luma ra, đổi (Y, U, V) sang RGB (ma trận `m`: YUV nguồn -> RGB thang
++ * 0..255), qua LUT, ghi ba mặt phẳng RGB cỡ luma — rồi CrabGeo_ConvRGBLuma/Chroma đổi sang YUV ra
++ * (màu 4:2:0 = trung bình khối 2x2 sau LUT). Màu của một điểm luma = mẫu màu ra của khối chứa nó
++ * (lặp ô), chỉ trong vùng nội dung [cxlo, cxhi] x [cylo, cyhi] của mặt phẳng màu (ngoài nội dung
++ * mặt phẳng float là 0). Đo trên nguồn DJI 10-bit, so bản chuẩn của bộ so 0.3 (RGB): lặp ô + trung
++ * bình khối 48,7 dB; song tuyến mẫu ở mép trái 46,1; bicubic mẫu ở giữa khối 48,0; hạ mẫu bicubic
++ * dọc kiểu swscale 48,1 — đường CPU 49,4 (bản chuẩn dựng từ chính đường CPU). */
++__global__ void CrabGeo_LutYUV(const float *__restrict__ Y, const float *__restrict__ U,
++                               const float *__restrict__ V, int w, int h,
++                               int cw, int ch, float csx, float csy, int cxlo, int cxhi, int cylo, int cyhi,
++                               const int *__restrict__ hidx, const int *__restrict__ vidx, CrabGeoMat m,
++                               float *R, float *G, float *B,
++                               const float4 *luta, const float4 *lutb, int n,
++                               float ar, float ag, float ab, float br, float bg, float bb, float mix)
++{
++    int x = blockIdx.x * blockDim.x + threadIdx.x;
++    int y = blockIdx.y * blockDim.y + threadIdx.y;
++    if (x >= w || y >= h || hidx[x] < 0 || vidx[y] < 0)
++        return;
++    int k = y * w + x;
++    int ci = clampi((int)(x / csx), cxlo, cxhi) + clampi((int)(y / csy), cylo, cyhi) * cw;
++    float u = U[ci], v = V[ci];
++    float yy = Y[k];
++    LutVec o = apply_luts(luta, lutb, n, ar, ag, ab, br, bg, bb, mix,
++                          mat_row(m, 0, yy, u, v), mat_row(m, 1, yy, u, v), mat_row(m, 2, yy, u, v));
++    R[k] = o.x;
++    G[k] = o.y;
++    B[k] = o.z;
++}
++
+ }

@@ -35,6 +35,9 @@ Repo chỉ chứa **kịch bản build + bản vá**; mã nguồn FFmpeg đượ
   cắt vùng nguồn (toạ độ lẻ, số thực), co (bicubic như swscale / bilinear / nearest), đặt vào khung
   ra có nền đen hoặc trong suốt, đổi ma trận/dải màu (bt601/bt709, tv/pc), ra `yuv420p`, `yuv444p`,
   `yuva420p`, `nv12`, `p010le`; ảnh RGBA lấy màu 4:2:0 trung bình theo alpha (`alpha_chroma=1`).
+  Từ `n8.1.1-crabbycut.2`: LUT 3D `.cube` áp lên nội dung sau phép co (`lut=`, thêm `lut2=` +
+  `mix=<biểu thức theo t>` để trộn hai LUT theo keyframe cường độ) — nội suy ba chiều như `lut3d`
+  `interp=trilinear`, tính float từ khung nguồn 10-bit chứ không qua RGB 8-bit.
 - **`crabblend_cuda`** — trộn lớp phủ đúng phép nguyên của `vf_overlay` ở chế độ alpha thẳng (trùng
   từng bit với bản CPU), `x`/`y`/`opacity` là biểu thức tính theo từng khung (keyframe độ mờ).
 - Cả hai mặc định `sync=1`: chờ GPU xong từng khung rồi mới đưa đi. Không chờ thì bản xuất có khung
