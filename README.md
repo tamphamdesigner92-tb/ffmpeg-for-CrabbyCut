@@ -1,7 +1,7 @@
 # ffmpeg-for-CrabbyCut
 
-Bản FFmpeg mà [CrabbyCut](https://github.com/tamphamdesigner92-tb/CrabbyCut) tải về khi cài trên
-Windows: **FFmpeg n8.1.1** cộng các bộ lọc CUDA riêng của CrabbyCut, để máy có GPU NVIDIA xuất
+Bản FFmpeg mà [CrabbyCut](https://github.com/tamphamdesigner92-tb/CrabbyCut) dùng trên
+Windows và macOS: **FFmpeg n8.1.1** cộng các bộ lọc CUDA riêng của CrabbyCut, để máy có GPU NVIDIA xuất
 video hoàn toàn trên GPU (NVDEC giải mã → co/cắt/đổi màu và ghép lớp phủ trên GPU → NVENC mã hoá).
 Máy không có NVIDIA vẫn dùng bản này như một FFmpeg bình thường (CUDA được nạp động).
 
@@ -21,6 +21,7 @@ Repo chỉ chứa **kịch bản build + bản vá**; mã nguồn FFmpeg đượ
 | Đường dẫn | Là gì |
 |---|---|
 | `build.sh` | Dựng từ đầu: kiểm gói → tải nguồn → áp bản vá → configure → make → install → đóng zip |
+| `build-macos.sh` | Như trên cho macOS Apple Silicon (VideoToolbox), thư viện ngoài dựng tĩnh từ nguồn |
 | `CRABBYCUT_VERSION` | Tên bản phát hành (`n8.1.1-crabbycut.N`) = chuỗi `ffmpeg -version` = tên tag/Release |
 | `patches/ffmpeg/` | Bản vá áp lên FFmpeg n8.1.1, thứ tự trong `series` |
 | `msys2-packages.txt` | Gói MSYS2 cần cài |
@@ -78,6 +79,30 @@ Nhánh nv-codec-headers dừng ở 12.2: bản 13.x đòi driver NVIDIA ≥ 610,
    GPU tự động và `CRABBYCUT_EXPORT_GPU=0` (xem `docs/APP_INTERNALS.md` của CrabbyCut).
 4. Commit, tag đúng tên trong `CRABBYCUT_VERSION`, push; tạo Release cho tag đó và tải zip lên.
 5. Sửa `scripts/ffmpeg_pin.js` của CrabbyCut theo các dòng `build.sh` in ra cuối bước package.
+
+## Bản macOS (`build-macos.sh`)
+
+Cùng FFmpeg `n8.1.1` + cùng bản vá + cùng chuỗi phiên bản như bản Windows, để CrabbyCut trên Mac cho
+đúng kết quả của bản Windows (ffmpeg Homebrew làm tròn khác bản 8.1.1 và thiếu `zscale`). Khác bản
+Windows chỉ ở phần tăng tốc phần cứng: VideoToolbox/AudioToolbox/CoreImage thay CUDA/NVENC/AMF/QSV;
+bộ lọc CUDA của bản vá tự tắt khi không có ffnvcodec; không có `libplacebo` (cần Vulkan) nên
+CrabbyCut lùi về `zscale` như máy Windows không có driver Vulkan.
+
+Thư viện ngoài cùng phiên bản với gói MSYS2 trong bản Windows, dựng **tĩnh** từ mã nguồn gốc (bảng
+`DEP_TABLE` trong kịch bản, có SHA-256) rồi liên kết vào các dylib của FFmpeg. Gói chỉ phụ thuộc thư
+viện hệ thống của macOS (kịch bản kiểm bằng `otool -L`), chạy trên mọi Mac Apple Silicon từ macOS 11,
+không cần Homebrew. Dylib nằm cạnh `ffmpeg`/`ffprobe` trong `bin/` và được tìm qua `@loader_path`.
+
+```bash
+brew install cmake meson ninja autoconf automake libtool pkgconf   # chỉ để BUILD
+./build-macos.sh                    # = check fetch deps configure make install package (~15 phút, M1 Pro)
+./build-macos.sh configure make install package    # chạy lại từng bước; deps đã dựng được giữ lại
+```
+
+Kết quả: `work-macos/dist/ffmpeg-<bản>-macos-arm64-gpl-shared.zip` + `.sha256`, cùng bố cục với zip
+Windows (`bin/`, `LICENSE.txt`, `licenses/`, `README.txt`). Log từng thư viện: `work-macos/logs/`.
+`RELEASE_TAG=<tag>` khi zip được phát hành dưới tag khác `CRABBYCUT_VERSION` (tag đó phải chứa kịch
+bản này — README.txt trong zip dẫn tới nó làm mã nguồn tương ứng).
 
 ## Phát triển bộ lọc
 
